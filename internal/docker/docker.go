@@ -63,7 +63,8 @@ func (c *Client) docker(args ...string) (string, error) {
 func (c *Client) ContainerStatus(containerID string) (string, error) {
 	status, err := c.docker("inspect", "--format", "{{.State.Status}}", containerID)
 	if err != nil {
-		if strings.Contains(err.Error(), "No such object") {
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "no such object") || strings.Contains(errText, "no such container") {
 			return StatusNotFound, nil
 		}
 		return "", err
