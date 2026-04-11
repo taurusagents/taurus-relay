@@ -459,6 +459,10 @@ func (t *Tunnel) messageLoop() error {
 			continue
 		}
 
+		if msg.Type == protocol.TypePong {
+			continue
+		}
+
 		// Handle async to not block the reader
 		go func(m protocol.Message) {
 			resp := t.handler.Handle(&m)
