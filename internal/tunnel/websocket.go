@@ -29,6 +29,24 @@ const (
 	ModeNode    Mode = "node"
 )
 
+const (
+	controlQueueSize        = 256
+	sessionQueueMaxMessages = 128
+	sessionQueueMaxBytes    = 1024 * 1024 // 1 MiB per session
+)
+
+type queuedOutput struct {
+	msg  *protocol.Message
+	size int
+}
+
+type sessionOutputQueue struct {
+	items  []queuedOutput
+	bytes  int
+	full   *sync.Cond
+	active bool
+}
+
 type NodeOptions struct {
 	Name          string
 	Host          string
@@ -52,7 +70,15 @@ type Tunnel struct {
 	shells *shell.Multiplexer
 	execs  *docker.ExecMultiplexer
 	docker *docker.Client
-	sendCh chan *protocol.Message
+
+	controlQ chan *protocol.Message
+
+	outputMu      sync.Mutex
+	outputQueues  map[string]*sessionOutputQueue
+	activeOutputs []string
+	rrIndex       int
+	outputReady   chan struct{}
+
 	stopCh chan struct{}
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -79,10 +105,14 @@ func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOption
 		mode:      mode,
 		node:      nodeOpts,
 		handler:   protocol.NewHandler(),
-		sendCh:    make(chan *protocol.Message, 256),
-		stopCh:    make(chan struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
+		controlQ:  make(chan *protocol.Message, controlQueueSize),
+
+		outputQueues: make(map[string]*sessionOutputQueue),
+		outputReady:  make(chan struct{}, 1),
+
+		stopCh: make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	if mode == ModeConnect {
@@ -93,15 +123,11 @@ func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOption
 					Data:      base64.StdEncoding.EncodeToString(data),
 				})
 				msg := &protocol.Message{Type: protocol.TypeShellOutput, Payload: payload}
-				select {
-				case t.sendCh <- msg:
-				default:
-					log.Printf("[tunnel] sendCh full, dropping shell.output for session %s", sessionID)
-				}
+				t.enqueueOutput(sessionID, msg, len(payload))
 			},
 			func(sessionID string, exitCode int) {
 				payload, _ := json.Marshal(protocol.ShellExitPayload{SessionID: sessionID, ExitCode: exitCode})
-				t.sendCh <- &protocol.Message{Type: protocol.TypeShellExit, Payload: payload}
+				t.enqueueControl(&protocol.Message{Type: protocol.TypeShellExit, Payload: payload})
 			},
 		)
 	}
@@ -115,15 +141,11 @@ func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOption
 					Data:      base64.StdEncoding.EncodeToString(data),
 				})
 				msg := &protocol.Message{Type: protocol.TypeContainerExecOutput, Payload: payload}
-				select {
-				case t.sendCh <- msg:
-				default:
-					log.Printf("[tunnel] sendCh full, dropping container.exec.output for session %s", sessionID)
-				}
+				t.enqueueOutput(sessionID, msg, len(payload))
 			},
 			func(sessionID string, exitCode int) {
 				payload, _ := json.Marshal(protocol.ShellExitPayload{SessionID: sessionID, ExitCode: exitCode})
-				t.sendCh <- &protocol.Message{Type: protocol.TypeContainerExecExit, Payload: payload}
+				t.enqueueControl(&protocol.Message{Type: protocol.TypeContainerExecExit, Payload: payload})
 			},
 		)
 	}
@@ -227,6 +249,11 @@ func (t *Tunnel) Run() error {
 // Stop gracefully shuts down the tunnel.
 func (t *Tunnel) Stop() {
 	t.cancel()
+	t.outputMu.Lock()
+	for _, q := range t.outputQueues {
+		q.full.Broadcast()
+	}
+	t.outputMu.Unlock()
 	if t.shells != nil {
 		t.shells.KillAll()
 	}
@@ -420,18 +447,33 @@ func (t *Tunnel) heartbeatInfo() *protocol.HeartbeatPayload {
 func (t *Tunnel) messageLoop() error {
 	// Start heartbeat
 	heartbeatStop := make(chan struct{})
-	go health.HeartbeatLoop(30*time.Second, t.heartbeatInfo, t.sendCh, heartbeatStop)
+	go health.HeartbeatLoop(30*time.Second, t.heartbeatInfo, t.controlQ, heartbeatStop)
 	defer close(heartbeatStop)
 
 	// Start writer goroutine
 	go func() {
 		for {
-			select {
-			case msg := <-t.sendCh:
+			if err := t.drainControlQueue(); err != nil {
+				log.Printf("[tunnel] write error: %v", err)
+				return
+			}
+
+			if msg, ok := t.dequeueOutput(); ok {
 				if err := t.writeMessage(msg); err != nil {
 					log.Printf("[tunnel] write error: %v", err)
 					return
 				}
+				continue
+			}
+
+			select {
+			case msg := <-t.controlQ:
+				if err := t.writeMessage(msg); err != nil {
+					log.Printf("[tunnel] write error: %v", err)
+					return
+				}
+			case <-t.outputReady:
+				continue
 			case <-t.ctx.Done():
 				return
 			case <-heartbeatStop:
@@ -467,9 +509,136 @@ func (t *Tunnel) messageLoop() error {
 		go func(m protocol.Message) {
 			resp := t.handler.Handle(&m)
 			if resp != nil {
-				t.sendCh <- resp
+				t.enqueueControl(resp)
 			}
 		}(msg)
+	}
+}
+
+func (t *Tunnel) enqueueControl(msg *protocol.Message) {
+	if msg == nil {
+		return
+	}
+	select {
+	case t.controlQ <- msg:
+	case <-t.ctx.Done():
+	}
+}
+
+func (t *Tunnel) enqueueOutput(sessionID string, msg *protocol.Message, size int) {
+	if msg == nil {
+		return
+	}
+	if size <= 0 {
+		size = len(msg.Payload)
+	}
+
+	t.outputMu.Lock()
+	q := t.outputQueues[sessionID]
+	if q == nil {
+		q = &sessionOutputQueue{}
+		q.full = sync.NewCond(&t.outputMu)
+		t.outputQueues[sessionID] = q
+	}
+
+	for t.sessionQueueWouldBlock(q, size) {
+		if t.ctx.Err() != nil {
+			t.outputMu.Unlock()
+			return
+		}
+		q.full.Wait()
+	}
+
+	q.items = append(q.items, queuedOutput{msg: msg, size: size})
+	q.bytes += size
+	if !q.active {
+		q.active = true
+		t.activeOutputs = append(t.activeOutputs, sessionID)
+	}
+	t.outputMu.Unlock()
+
+	select {
+	case t.outputReady <- struct{}{}:
+	default:
+	}
+}
+
+func (t *Tunnel) sessionQueueWouldBlock(q *sessionOutputQueue, incomingSize int) bool {
+	if len(q.items) >= sessionQueueMaxMessages {
+		return true
+	}
+	if incomingSize > sessionQueueMaxBytes {
+		return len(q.items) > 0
+	}
+	return q.bytes+incomingSize > sessionQueueMaxBytes
+}
+
+func (t *Tunnel) dequeueOutput() (*protocol.Message, bool) {
+	t.outputMu.Lock()
+	defer t.outputMu.Unlock()
+
+	for len(t.activeOutputs) > 0 {
+		idx := t.rrIndex % len(t.activeOutputs)
+		sessionID := t.activeOutputs[idx]
+		q := t.outputQueues[sessionID]
+		if q == nil || len(q.items) == 0 {
+			t.removeActiveOutputAt(idx)
+			continue
+		}
+
+		item := q.items[0]
+		q.items = q.items[1:]
+		q.bytes -= item.size
+		if q.bytes < 0 {
+			q.bytes = 0
+		}
+		q.full.Signal()
+
+		if len(q.items) == 0 {
+			t.removeActiveOutputAt(idx)
+		} else {
+			t.rrIndex = (idx + 1) % len(t.activeOutputs)
+		}
+		return item.msg, true
+	}
+
+	t.rrIndex = 0
+	return nil, false
+}
+
+func (t *Tunnel) removeActiveOutputAt(idx int) {
+	if idx < 0 || idx >= len(t.activeOutputs) {
+		return
+	}
+	sessionID := t.activeOutputs[idx]
+	q := t.outputQueues[sessionID]
+	if q != nil {
+		q.active = false
+	}
+
+	t.activeOutputs = append(t.activeOutputs[:idx], t.activeOutputs[idx+1:]...)
+	if len(t.activeOutputs) == 0 {
+		t.rrIndex = 0
+		return
+	}
+	if idx < t.rrIndex {
+		t.rrIndex--
+	}
+	if t.rrIndex >= len(t.activeOutputs) {
+		t.rrIndex = 0
+	}
+}
+
+func (t *Tunnel) drainControlQueue() error {
+	for {
+		select {
+		case msg := <-t.controlQ:
+			if err := t.writeMessage(msg); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
 	}
 }
 
