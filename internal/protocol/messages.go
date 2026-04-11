@@ -207,6 +207,17 @@ type ContainerExecKillPayload struct {
 	SessionID   string `json:"session_id"`
 }
 
+type ContainerExecCommandPayload struct {
+	ContainerID string   `json:"container_id"`
+	Command     []string `json:"command"`
+}
+
+type ContainerExecWithStdinPayload struct {
+	ContainerID string   `json:"container_id"`
+	Command     []string `json:"command"`
+	Stdin       string   `json:"stdin"`
+}
+
 type ContainerIDPayload struct {
 	ContainerID string `json:"container_id"`
 }
@@ -299,6 +310,8 @@ const (
 	TypeContainerStop           = "container.stop"
 	TypeContainerDestroy        = "container.destroy"
 	TypeContainerStatus         = "container.status"
+	TypeContainerExecCommand    = "container.exec_command"
+	TypeContainerExecWithStdin  = "container.exec_with_stdin"
 
 	TypeHeartbeat = "heartbeat"
 	TypePing      = "ping"

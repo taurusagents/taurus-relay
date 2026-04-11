@@ -179,6 +179,8 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeContainerStop, t.handleContainerStop)
 		h.Register(protocol.TypeContainerDestroy, t.handleContainerDestroy)
 		h.Register(protocol.TypeContainerStatus, t.handleContainerStatus)
+		h.Register(protocol.TypeContainerExecCommand, t.handleContainerExecCommand)
+		h.Register(protocol.TypeContainerExecWithStdin, t.handleContainerExecWithStdin)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -946,6 +948,38 @@ func (t *Tunnel) handleContainerStatus(id string, payload json.RawMessage) (stri
 	}
 	log.Printf("[relay-node] rpc container.status container=%s status=%s", p.ContainerID, status)
 	return protocol.TypeContainerStatus + ".result", map[string]string{"status": status}, nil
+}
+
+func (t *Tunnel) handleContainerExecCommand(id string, payload json.RawMessage) (string, any, error) {
+	if t.docker == nil {
+		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("docker client not initialized")
+	}
+	var p protocol.ContainerExecCommandPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc container.exec_command container=%s command=%v", p.ContainerID, p.Command)
+	output, err := t.docker.ExecCommand(p.ContainerID, p.Command)
+	if err != nil {
+		return protocol.TypeContainerExecCommand + ".result", nil, err
+	}
+	return protocol.TypeContainerExecCommand + ".result", map[string]string{"output": output}, nil
+}
+
+func (t *Tunnel) handleContainerExecWithStdin(id string, payload json.RawMessage) (string, any, error) {
+	if t.docker == nil {
+		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("docker client not initialized")
+	}
+	var p protocol.ContainerExecWithStdinPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc container.exec_with_stdin container=%s command=%v", p.ContainerID, p.Command)
+	output, err := t.docker.ExecWithStdin(p.ContainerID, p.Command, p.Stdin)
+	if err != nil {
+		return protocol.TypeContainerExecWithStdin + ".result", nil, err
+	}
+	return protocol.TypeContainerExecWithStdin + ".result", map[string]string{"output": output}, nil
 }
 
 // --- File message handlers ---

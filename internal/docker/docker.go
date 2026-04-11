@@ -227,6 +227,31 @@ func (c *Client) Destroy(containerID string) error {
 	return err
 }
 
+func (c *Client) ExecCommand(containerID string, command []string) (string, error) {
+	args := append([]string{"exec", containerID}, command...)
+	log.Printf("[relay-node/docker] exec_command container=%s command=%v", containerID, command)
+	out, err := c.docker(args...)
+	if err != nil {
+		log.Printf("[relay-node/docker] exec_command failed container=%s: %v", containerID, err)
+		return "", err
+	}
+	return out, nil
+}
+
+func (c *Client) ExecWithStdin(containerID string, command []string, stdin string) (string, error) {
+	args := append([]string{"exec", "-i", containerID}, command...)
+	log.Printf("[relay-node/docker] exec_with_stdin container=%s command=%v stdin_len=%d", containerID, command, len(stdin))
+	cmd := exec.Command("docker", args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		log.Printf("[relay-node/docker] exec_with_stdin failed container=%s: %s", containerID, msg)
+		return "", fmt.Errorf("docker exec: %s", msg)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func (c *Client) RunningContainerCount() int {
 	out, err := c.docker("ps", "-q")
 	if err != nil || out == "" {
