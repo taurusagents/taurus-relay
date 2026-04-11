@@ -617,6 +617,7 @@ func (t *Tunnel) handleContainerEnsure(id string, payload json.RawMessage) (stri
 	if image == "" {
 		image = p.DockerImage
 	}
+	log.Printf("[relay-node] rpc container.ensure container=%s image=%s user=%s agent=%s", p.ContainerID, image, p.UserID, p.AgentID)
 	err := t.docker.EnsureContainer(docker.EnsureOptions{
 		ContainerID: p.ContainerID,
 		Image:       image,
@@ -652,6 +653,7 @@ func (t *Tunnel) handleContainerExec(id string, payload json.RawMessage) (string
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.exec container=%s session=%s command=%s", p.ContainerID, p.SessionID, p.Command)
 	if err := t.execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env); err != nil {
 		return protocol.TypeContainerExec + ".result", nil, err
 	}
@@ -663,6 +665,7 @@ func (t *Tunnel) handleContainerExecStdin(id string, payload json.RawMessage) (s
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerExecStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.exec.stdin session=%s", p.SessionID)
 	sess, err := t.execs.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeContainerExecStdin + ".result", nil, err
@@ -678,6 +681,7 @@ func (t *Tunnel) handleContainerExecSignal(id string, payload json.RawMessage) (
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerExecSignal + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.exec.signal session=%s signal=%s shell_pid=%d", p.SessionID, p.Signal, p.ShellPID)
 	sess, err := t.execs.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeContainerExecSignal + ".result", nil, err
@@ -693,6 +697,7 @@ func (t *Tunnel) handleContainerExecKill(id string, payload json.RawMessage) (st
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerExecKill + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.exec.kill session=%s", p.SessionID)
 	if err := t.execs.Kill(p.SessionID); err != nil {
 		return protocol.TypeContainerExecKill + ".result", nil, err
 	}
@@ -704,7 +709,9 @@ func (t *Tunnel) handleContainerExecCheckAlive(id string, payload json.RawMessag
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerExecCheckAlive + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
-	return protocol.TypeContainerExecCheckAlive + ".result", map[string]bool{"alive": t.execs.CheckAlive(p.SessionID)}, nil
+	alive := t.execs.CheckAlive(p.SessionID)
+	log.Printf("[relay-node] rpc container.exec.check_alive session=%s alive=%t", p.SessionID, alive)
+	return protocol.TypeContainerExecCheckAlive + ".result", map[string]bool{"alive": alive}, nil
 }
 
 func (t *Tunnel) handleContainerPause(id string, payload json.RawMessage) (string, any, error) {
@@ -712,6 +719,7 @@ func (t *Tunnel) handleContainerPause(id string, payload json.RawMessage) (strin
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.pause container=%s", p.ContainerID)
 	if err := t.docker.Pause(p.ContainerID); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, err
 	}
@@ -723,6 +731,7 @@ func (t *Tunnel) handleContainerUnpause(id string, payload json.RawMessage) (str
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerUnpause + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.unpause container=%s", p.ContainerID)
 	if err := t.docker.Unpause(p.ContainerID); err != nil {
 		return protocol.TypeContainerUnpause + ".result", nil, err
 	}
@@ -734,6 +743,7 @@ func (t *Tunnel) handleContainerStop(id string, payload json.RawMessage) (string
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.stop container=%s", p.ContainerID)
 	if err := t.docker.Stop(p.ContainerID); err != nil {
 		return protocol.TypeContainerStop + ".result", nil, err
 	}
@@ -745,6 +755,7 @@ func (t *Tunnel) handleContainerDestroy(id string, payload json.RawMessage) (str
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	log.Printf("[relay-node] rpc container.destroy container=%s", p.ContainerID)
 	if err := t.docker.Destroy(p.ContainerID); err != nil {
 		return protocol.TypeContainerDestroy + ".result", nil, err
 	}
@@ -760,6 +771,7 @@ func (t *Tunnel) handleContainerStatus(id string, payload json.RawMessage) (stri
 	if err != nil {
 		return protocol.TypeContainerStatus + ".result", nil, err
 	}
+	log.Printf("[relay-node] rpc container.status container=%s status=%s", p.ContainerID, status)
 	return protocol.TypeContainerStatus + ".result", map[string]string{"status": status}, nil
 }
 

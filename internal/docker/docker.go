@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,19 +83,27 @@ func (c *Client) ContainerStatus(containerID string) (string, error) {
 func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	status, err := c.ContainerStatus(opts.ContainerID)
 	if err != nil {
+		log.Printf("[relay-node/docker] container.ensure status lookup failed container=%s: %v", opts.ContainerID, err)
 		return err
 	}
 
 	if status == StatusRunning {
+		log.Printf("[relay-node/docker] container.ensure already running container=%s", opts.ContainerID)
 		return nil
 	}
 
 	if status != StatusNotFound {
 		if status == StatusPaused {
+			log.Printf("[relay-node/docker] container.ensure unpausing existing container=%s", opts.ContainerID)
 			_, err := c.docker("unpause", opts.ContainerID)
+			if err != nil {
+				log.Printf("[relay-node/docker] container.ensure unpause failed container=%s: %v", opts.ContainerID, err)
+			}
 			return err
 		}
+		log.Printf("[relay-node/docker] container.ensure starting existing container=%s status=%s", opts.ContainerID, status)
 		if _, err := c.docker("start", opts.ContainerID); err != nil {
+			log.Printf("[relay-node/docker] container.ensure start failed container=%s: %v", opts.ContainerID, err)
 			return err
 		}
 		return nil
@@ -141,22 +150,34 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	}
 
 	createArgs = append(createArgs, opts.Image, "sleep", "infinity")
+	log.Printf("[relay-node/docker] container.ensure creating container=%s image=%s user=%s agent=%s root=%s mounts=%d cpus=%.2f mem_mb=%d pids=%d",
+		opts.ContainerID, opts.Image, opts.UserID, opts.AgentID, opts.RootAgentID, len(opts.Mounts),
+		opts.ResourceLimits.CPUs, opts.ResourceLimits.MemoryMB, opts.ResourceLimits.PidsLimit,
+	)
 	if _, err := c.docker(createArgs...); err != nil {
+		log.Printf("[relay-node/docker] container.ensure create failed container=%s: %v", opts.ContainerID, err)
 		return err
 	}
 	if _, err := c.docker("start", opts.ContainerID); err != nil {
+		log.Printf("[relay-node/docker] container.ensure start failed container=%s: %v", opts.ContainerID, err)
 		return err
 	}
+	log.Printf("[relay-node/docker] container.ensure ready container=%s", opts.ContainerID)
 	return nil
 }
 
 func (c *Client) Pause(containerID string) error {
 	status, err := c.ContainerStatus(containerID)
 	if err != nil {
+		log.Printf("[relay-node/docker] container.pause status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusRunning {
+		log.Printf("[relay-node/docker] container.pause container=%s", containerID)
 		_, err = c.docker("pause", containerID)
+	}
+	if err != nil {
+		log.Printf("[relay-node/docker] container.pause failed container=%s: %v", containerID, err)
 	}
 	return err
 }
@@ -164,10 +185,15 @@ func (c *Client) Pause(containerID string) error {
 func (c *Client) Unpause(containerID string) error {
 	status, err := c.ContainerStatus(containerID)
 	if err != nil {
+		log.Printf("[relay-node/docker] container.unpause status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusPaused {
+		log.Printf("[relay-node/docker] container.unpause container=%s", containerID)
 		_, err = c.docker("unpause", containerID)
+	}
+	if err != nil {
+		log.Printf("[relay-node/docker] container.unpause failed container=%s: %v", containerID, err)
 	}
 	return err
 }
@@ -175,18 +201,28 @@ func (c *Client) Unpause(containerID string) error {
 func (c *Client) Stop(containerID string) error {
 	status, err := c.ContainerStatus(containerID)
 	if err != nil {
+		log.Printf("[relay-node/docker] container.stop status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusRunning || status == StatusPaused {
+		log.Printf("[relay-node/docker] container.stop container=%s status=%s", containerID, status)
 		_, err = c.docker("stop", "-t", "5", containerID)
+	}
+	if err != nil {
+		log.Printf("[relay-node/docker] container.stop failed container=%s: %v", containerID, err)
 	}
 	return err
 }
 
 func (c *Client) Destroy(containerID string) error {
+	log.Printf("[relay-node/docker] container.destroy container=%s", containerID)
 	_, err := c.docker("rm", "-f", containerID)
-	if err != nil && strings.Contains(err.Error(), "No such object") {
-		return nil
+	if err != nil {
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "no such object") || strings.Contains(errText, "no such container") {
+			return nil
+		}
+		log.Printf("[relay-node/docker] container.destroy failed container=%s: %v", containerID, err)
 	}
 	return err
 }

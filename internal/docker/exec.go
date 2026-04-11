@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -53,6 +54,7 @@ func (s *ExecSession) WriteStdinBase64(b64 string) error {
 }
 
 func (s *ExecSession) Signal(signal string, shellPID int) error {
+	log.Printf("[relay-node/exec] signal session=%s container=%s signal=%s shell_pid=%d", s.ID, s.ContainerID, signal, shellPID)
 	if shellPID > 0 {
 		sigName := strings.TrimPrefix(strings.ToUpper(signal), "SIG")
 		cmd := exec.Command("docker", "exec", s.ContainerID, "kill", "-s", sigName, strconv.Itoa(shellPID))
@@ -68,6 +70,7 @@ func (s *ExecSession) Signal(signal string, shellPID int) error {
 }
 
 func (s *ExecSession) Kill() error {
+	log.Printf("[relay-node/exec] kill session=%s container=%s", s.ID, s.ContainerID)
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 	}
@@ -127,6 +130,7 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 	dockerArgs = append(dockerArgs, containerID, command)
 	dockerArgs = append(dockerArgs, args...)
 
+	log.Printf("[relay-node/exec] start session=%s container=%s command=%s args=%d cwd=%q", sessionID, containerID, command, len(args), cwd)
 	cmd := exec.Command("docker", dockerArgs...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -141,6 +145,7 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
+		log.Printf("[relay-node/exec] start failed session=%s container=%s: %v", sessionID, containerID, err)
 		return fmt.Errorf("start docker exec: %w", err)
 	}
 
@@ -188,6 +193,7 @@ func (m *ExecMultiplexer) wait(sessionID string, sess *ExecSession) {
 		}
 	}
 	sess.setAlive(false)
+	log.Printf("[relay-node/exec] exit session=%s container=%s exit_code=%d err=%v", sessionID, sess.ContainerID, exitCode, err)
 
 	m.mu.Lock()
 	delete(m.sessions, sessionID)
