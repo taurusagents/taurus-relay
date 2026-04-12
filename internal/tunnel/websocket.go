@@ -171,6 +171,7 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeContainerEnsure, t.handleContainerEnsure)
 		h.Register(protocol.TypeContainerExec, t.handleContainerExec)
 		h.Register(protocol.TypeContainerExecStdin, t.handleContainerExecStdin)
+		h.Register(protocol.TypeContainerExecResize, t.handleContainerExecResize)
 		h.Register(protocol.TypeContainerExecSignal, t.handleContainerExecSignal)
 		h.Register(protocol.TypeContainerExecKill, t.handleContainerExecKill)
 		h.Register(protocol.TypeContainerExecCheckAlive, t.handleContainerExecCheckAlive)
@@ -829,7 +830,7 @@ func (t *Tunnel) handleContainerExec(id string, payload json.RawMessage) (string
 		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec container=%s session=%s command=%s", p.ContainerID, p.SessionID, p.Command)
-	if err := t.execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env); err != nil {
+	if err := t.execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env, p.Tty, p.Cols, p.Rows); err != nil {
 		return protocol.TypeContainerExec + ".result", nil, err
 	}
 	return protocol.TypeContainerExec + ".result", map[string]string{"status": "started", "session_id": p.SessionID}, nil
@@ -849,6 +850,18 @@ func (t *Tunnel) handleContainerExecStdin(id string, payload json.RawMessage) (s
 		return protocol.TypeContainerExecStdin + ".result", nil, err
 	}
 	return protocol.TypeContainerExecStdin + ".result", nil, nil
+}
+
+func (t *Tunnel) handleContainerExecResize(id string, payload json.RawMessage) (string, any, error) {
+	var p protocol.ContainerExecResizePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return protocol.TypeContainerExecResize + ".result", nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc container.exec.resize session=%s cols=%d rows=%d", p.SessionID, p.Cols, p.Rows)
+	if err := t.execs.Resize(p.SessionID, p.Cols, p.Rows); err != nil {
+		return protocol.TypeContainerExecResize + ".result", nil, err
+	}
+	return protocol.TypeContainerExecResize + ".result", nil, nil
 }
 
 func (t *Tunnel) handleContainerExecSignal(id string, payload json.RawMessage) (string, any, error) {

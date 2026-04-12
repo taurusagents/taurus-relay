@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/creack/pty"
 )
 
 type ExecOutputCallback func(sessionID string, data []byte)
@@ -20,6 +23,8 @@ type ExecSession struct {
 	ContainerID string
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
+	tty         bool
+	ptyFile     *os.File
 
 	mu    sync.RWMutex
 	alive bool
@@ -69,10 +74,23 @@ func (s *ExecSession) Signal(signal string, shellPID int) error {
 	return s.cmd.Process.Signal(parseSignal(signal))
 }
 
+func (s *ExecSession) Resize(cols, rows uint16) error {
+	if !s.tty || s.ptyFile == nil {
+		return nil
+	}
+	if cols == 0 || rows == 0 {
+		return nil
+	}
+	return pty.Setsize(s.ptyFile, &pty.Winsize{Cols: cols, Rows: rows})
+}
+
 func (s *ExecSession) Kill() error {
 	log.Printf("[relay-node/exec] kill session=%s container=%s", s.ID, s.ContainerID)
 	if s.stdin != nil {
 		_ = s.stdin.Close()
+	}
+	if s.ptyFile != nil {
+		_ = s.ptyFile.Close()
 	}
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
@@ -108,7 +126,7 @@ func NewExecMultiplexer(onOutput ExecOutputCallback, onExit ExecExitCallback) *E
 	}
 }
 
-func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []string, cwd string, env map[string]string) error {
+func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []string, cwd string, env map[string]string, tty bool, cols, rows uint16) error {
 	m.mu.Lock()
 	if _, exists := m.sessions[sessionID]; exists {
 		m.mu.Unlock()
@@ -121,6 +139,9 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 	}
 
 	dockerArgs := []string{"exec", "-i"}
+	if tty {
+		dockerArgs = append(dockerArgs, "-t")
+	}
 	if cwd != "" {
 		dockerArgs = append(dockerArgs, "-w", cwd)
 	}
@@ -130,8 +151,39 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 	dockerArgs = append(dockerArgs, containerID, command)
 	dockerArgs = append(dockerArgs, args...)
 
-	log.Printf("[relay-node/exec] start session=%s container=%s command=%s args=%d cwd=%q", sessionID, containerID, command, len(args), cwd)
+	log.Printf("[relay-node/exec] start session=%s container=%s command=%s args=%d cwd=%q tty=%t", sessionID, containerID, command, len(args), cwd, tty)
 	cmd := exec.Command("docker", dockerArgs...)
+
+	if tty {
+		var winsize *pty.Winsize
+		if cols > 0 && rows > 0 {
+			winsize = &pty.Winsize{Cols: cols, Rows: rows}
+		}
+		ptmx, err := pty.StartWithSize(cmd, winsize)
+		if err != nil {
+			log.Printf("[relay-node/exec] start failed session=%s container=%s: %v", sessionID, containerID, err)
+			return fmt.Errorf("start docker exec with pty: %w", err)
+		}
+
+		sess := &ExecSession{
+			ID:          sessionID,
+			ContainerID: containerID,
+			cmd:         cmd,
+			stdin:       ptmx,
+			tty:         true,
+			ptyFile:     ptmx,
+			alive:       true,
+		}
+
+		m.mu.Lock()
+		m.sessions[sessionID] = sess
+		m.mu.Unlock()
+
+		go m.streamOutput(sessionID, ptmx)
+		go m.wait(sessionID, sess)
+		return nil
+	}
+
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
@@ -154,6 +206,7 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 		ContainerID: containerID,
 		cmd:         cmd,
 		stdin:       stdin,
+		tty:         false,
 		alive:       true,
 	}
 
@@ -184,6 +237,9 @@ func (m *ExecMultiplexer) streamOutput(sessionID string, r io.Reader) {
 
 func (m *ExecMultiplexer) wait(sessionID string, sess *ExecSession) {
 	err := sess.cmd.Wait()
+	if sess.ptyFile != nil {
+		_ = sess.ptyFile.Close()
+	}
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -234,6 +290,14 @@ func (m *ExecMultiplexer) Kill(sessionID string) error {
 		return err
 	}
 	return s.Kill()
+}
+
+func (m *ExecMultiplexer) Resize(sessionID string, cols, rows uint16) error {
+	s, err := m.Get(sessionID)
+	if err != nil {
+		return err
+	}
+	return s.Resize(cols, rows)
 }
 
 func (m *ExecMultiplexer) KillAll() {

@@ -186,6 +186,9 @@ type ContainerExecPayload struct {
 	Args        []string          `json:"args,omitempty"`
 	CWD         string            `json:"cwd,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	Tty         bool              `json:"tty,omitempty"`
+	Cols        uint16            `json:"cols,omitempty"`
+	Rows        uint16            `json:"rows,omitempty"`
 	Stream      bool              `json:"stream,omitempty"`
 }
 
@@ -193,6 +196,12 @@ type ContainerExecStdinPayload struct {
 	ContainerID string `json:"container_id"`
 	SessionID   string `json:"session_id"`
 	Data        string `json:"data"`
+}
+
+type ContainerExecResizePayload struct {
+	SessionID string `json:"session_id"`
+	Cols      uint16 `json:"cols"`
+	Rows      uint16 `json:"rows"`
 }
 
 type ContainerExecSignalPayload struct {
@@ -302,6 +311,7 @@ const (
 	TypeContainerExecOutput     = "container.exec.output"
 	TypeContainerExecExit       = "container.exec.exit"
 	TypeContainerExecStdin      = "container.exec.stdin"
+	TypeContainerExecResize     = "container.exec.resize"
 	TypeContainerExecSignal     = "container.exec.signal"
 	TypeContainerExecKill       = "container.exec.kill"
 	TypeContainerExecCheckAlive = "container.exec.check_alive"
