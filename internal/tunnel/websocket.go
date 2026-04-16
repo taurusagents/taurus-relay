@@ -30,9 +30,10 @@ const (
 )
 
 const (
-	controlQueueSize        = 256
-	sessionQueueMaxMessages = 128
-	sessionQueueMaxBytes    = 1024 * 1024 // 1 MiB per session
+	controlQueueSize           = 256
+	sessionQueueMaxMessages    = 128
+	sessionQueueMaxBytes       = 1024 * 1024 // 1 MiB per session
+	containerExecReapTimeoutMs = 3000
 )
 
 type queuedOutput struct {
@@ -902,13 +903,43 @@ func (t *Tunnel) handleContainerExecCheckAlive(id string, payload json.RawMessag
 	return protocol.TypeContainerExecCheckAlive + ".result", map[string]bool{"alive": alive}, nil
 }
 
+func (t *Tunnel) terminateContainerExecSessions(containerID, lifecycleOp string) error {
+	if t.execs == nil {
+		return nil
+	}
+	killed, err := t.execs.KillByContainer(containerID, containerExecReapTimeoutMs)
+	if err != nil {
+		log.Printf("[relay-node] rpc %s container=%s exec_cleanup_failed killed=%d err=%v", lifecycleOp, containerID, killed, err)
+		return err
+	}
+	if killed > 0 {
+		log.Printf("[relay-node] rpc %s container=%s exec_cleanup_killed=%d", lifecycleOp, containerID, killed)
+	}
+	return nil
+}
+
+func (t *Tunnel) withContainerMutation(containerID, lifecycleOp string, action func() error) error {
+	if t.execs == nil {
+		return action()
+	}
+	t.execs.BeginContainerMutation(containerID)
+	defer t.execs.EndContainerMutation(containerID)
+
+	if err := t.terminateContainerExecSessions(containerID, lifecycleOp); err != nil {
+		return fmt.Errorf("terminate container exec sessions: %w", err)
+	}
+	return action()
+}
+
 func (t *Tunnel) handleContainerPause(id string, payload json.RawMessage) (string, any, error) {
 	var p protocol.ContainerIDPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.pause container=%s", p.ContainerID)
-	if err := t.docker.Pause(p.ContainerID); err != nil {
+	if err := t.withContainerMutation(p.ContainerID, "container.pause", func() error {
+		return t.docker.Pause(p.ContainerID)
+	}); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, err
 	}
 	return protocol.TypeContainerPause + ".result", map[string]string{"status": "ok"}, nil
@@ -932,7 +963,9 @@ func (t *Tunnel) handleContainerStop(id string, payload json.RawMessage) (string
 		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.stop container=%s", p.ContainerID)
-	if err := t.docker.Stop(p.ContainerID); err != nil {
+	if err := t.withContainerMutation(p.ContainerID, "container.stop", func() error {
+		return t.docker.Stop(p.ContainerID)
+	}); err != nil {
 		return protocol.TypeContainerStop + ".result", nil, err
 	}
 	return protocol.TypeContainerStop + ".result", map[string]string{"status": "ok"}, nil
@@ -944,7 +977,9 @@ func (t *Tunnel) handleContainerDestroy(id string, payload json.RawMessage) (str
 		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.destroy container=%s", p.ContainerID)
-	if err := t.docker.Destroy(p.ContainerID); err != nil {
+	if err := t.withContainerMutation(p.ContainerID, "container.destroy", func() error {
+		return t.docker.Destroy(p.ContainerID)
+	}); err != nil {
 		return protocol.TypeContainerDestroy + ".result", nil, err
 	}
 	return protocol.TypeContainerDestroy + ".result", map[string]string{"status": "ok"}, nil

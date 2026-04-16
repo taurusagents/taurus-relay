@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -112,18 +113,99 @@ func parseSignal(signal string) syscall.Signal {
 }
 
 type ExecMultiplexer struct {
-	sessions map[string]*ExecSession
-	mu       sync.RWMutex
-	onOutput ExecOutputCallback
-	onExit   ExecExitCallback
+	sessions            map[string]*ExecSession
+	sessionsByContainer map[string]map[string]struct{}
+	containerMutations  map[string]int
+	mu                  sync.RWMutex
+	onOutput            ExecOutputCallback
+	onExit              ExecExitCallback
 }
 
 func NewExecMultiplexer(onOutput ExecOutputCallback, onExit ExecExitCallback) *ExecMultiplexer {
 	return &ExecMultiplexer{
-		sessions: make(map[string]*ExecSession),
-		onOutput: onOutput,
-		onExit:   onExit,
+		sessions:            make(map[string]*ExecSession),
+		sessionsByContainer: make(map[string]map[string]struct{}),
+		containerMutations:  make(map[string]int),
+		onOutput:            onOutput,
+		onExit:              onExit,
 	}
+}
+
+func (m *ExecMultiplexer) addSessionLocked(sess *ExecSession) {
+	m.sessions[sess.ID] = sess
+	byContainer, ok := m.sessionsByContainer[sess.ContainerID]
+	if !ok {
+		byContainer = make(map[string]struct{})
+		m.sessionsByContainer[sess.ContainerID] = byContainer
+	}
+	byContainer[sess.ID] = struct{}{}
+}
+
+func (m *ExecMultiplexer) removeSessionLocked(sessionID string) *ExecSession {
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	delete(m.sessions, sessionID)
+	if byContainer, exists := m.sessionsByContainer[sess.ContainerID]; exists {
+		delete(byContainer, sessionID)
+		if len(byContainer) == 0 {
+			delete(m.sessionsByContainer, sess.ContainerID)
+		}
+	}
+	return sess
+}
+
+func (m *ExecMultiplexer) registerSession(containerID, sessionID string, sess *ExecSession) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[sessionID]; exists {
+		return fmt.Errorf("exec session %s already exists", sessionID)
+	}
+	if m.containerMutations[containerID] > 0 {
+		_ = sess.Kill()
+		return fmt.Errorf("container %s is in lifecycle transition; cannot start exec session", containerID)
+	}
+	m.addSessionLocked(sess)
+	return nil
+}
+
+func (m *ExecMultiplexer) BeginContainerMutation(containerID string) {
+	m.mu.Lock()
+	m.containerMutations[containerID] = m.containerMutations[containerID] + 1
+	m.mu.Unlock()
+}
+
+func (m *ExecMultiplexer) EndContainerMutation(containerID string) {
+	m.mu.Lock()
+	if n := m.containerMutations[containerID]; n <= 1 {
+		delete(m.containerMutations, containerID)
+	} else {
+		m.containerMutations[containerID] = n - 1
+	}
+	m.mu.Unlock()
+}
+
+func (m *ExecMultiplexer) sessionsForContainer(containerID string) []*ExecSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byContainer, ok := m.sessionsByContainer[containerID]
+	if !ok || len(byContainer) == 0 {
+		return nil
+	}
+	sessions := make([]*ExecSession, 0, len(byContainer))
+	for sessionID := range byContainer {
+		if sess, exists := m.sessions[sessionID]; exists {
+			sessions = append(sessions, sess)
+		}
+	}
+	return sessions
+}
+
+func (m *ExecMultiplexer) countForContainer(containerID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessionsByContainer[containerID])
 }
 
 func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []string, cwd string, env map[string]string, tty bool, cols, rows uint16) error {
@@ -131,6 +213,10 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 	if _, exists := m.sessions[sessionID]; exists {
 		m.mu.Unlock()
 		return fmt.Errorf("exec session %s already exists", sessionID)
+	}
+	if m.containerMutations[containerID] > 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("container %s is in lifecycle transition; cannot start exec session", containerID)
 	}
 	m.mu.Unlock()
 
@@ -175,9 +261,11 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 			alive:       true,
 		}
 
-		m.mu.Lock()
-		m.sessions[sessionID] = sess
-		m.mu.Unlock()
+		if err := m.registerSession(containerID, sessionID, sess); err != nil {
+			_ = sess.Kill()
+			go func() { _ = sess.cmd.Wait() }()
+			return err
+		}
 
 		go m.streamOutput(sessionID, ptmx)
 		go m.wait(sessionID, sess)
@@ -210,9 +298,11 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 		alive:       true,
 	}
 
-	m.mu.Lock()
-	m.sessions[sessionID] = sess
-	m.mu.Unlock()
+	if err := m.registerSession(containerID, sessionID, sess); err != nil {
+		_ = sess.Kill()
+		go func() { _ = sess.cmd.Wait() }()
+		return err
+	}
 
 	go m.streamOutput(sessionID, stdout)
 	go m.streamOutput(sessionID, stderr)
@@ -252,7 +342,7 @@ func (m *ExecMultiplexer) wait(sessionID string, sess *ExecSession) {
 	log.Printf("[relay-node/exec] exit session=%s container=%s exit_code=%d err=%v", sessionID, sess.ContainerID, exitCode, err)
 
 	m.mu.Lock()
-	delete(m.sessions, sessionID)
+	m.removeSessionLocked(sessionID)
 	m.mu.Unlock()
 
 	if m.onExit != nil {
@@ -292,6 +382,35 @@ func (m *ExecMultiplexer) Kill(sessionID string) error {
 	return s.Kill()
 }
 
+func (m *ExecMultiplexer) KillByContainer(containerID string, waitTimeoutMs int) (int, error) {
+	sessions := m.sessionsForContainer(containerID)
+	if len(sessions) == 0 {
+		return 0, nil
+	}
+	log.Printf("[relay-node/exec] kill_by_container container=%s sessions=%d", containerID, len(sessions))
+	for _, s := range sessions {
+		if err := s.Kill(); err != nil {
+			log.Printf("[relay-node/exec] kill_by_container session=%s container=%s kill_err=%v", s.ID, containerID, err)
+		}
+	}
+
+	if waitTimeoutMs <= 0 {
+		return len(sessions), nil
+	}
+
+	deadline := time.Now().Add(time.Duration(waitTimeoutMs) * time.Millisecond)
+	for {
+		remaining := m.countForContainer(containerID)
+		if remaining == 0 {
+			return len(sessions), nil
+		}
+		if time.Now().After(deadline) {
+			return len(sessions), fmt.Errorf("timed out waiting for %d exec session(s) to exit for container %s", remaining, containerID)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 func (m *ExecMultiplexer) Resize(sessionID string, cols, rows uint16) error {
 	s, err := m.Get(sessionID)
 	if err != nil {
@@ -307,6 +426,8 @@ func (m *ExecMultiplexer) KillAll() {
 		sessions = append(sessions, s)
 	}
 	m.sessions = make(map[string]*ExecSession)
+	m.sessionsByContainer = make(map[string]map[string]struct{})
+	m.containerMutations = make(map[string]int)
 	m.mu.Unlock()
 
 	for _, s := range sessions {
