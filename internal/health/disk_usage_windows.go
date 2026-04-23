@@ -31,5 +31,5 @@ func diskUsageGB(path string) (usedGB, availableGB float64) {
 
 	usedBytes := totalBytes - totalFreeBytes
 	const gb = 1024 * 1024 * 1024
-	return float64(usedBytes) / gb, float64(totalFreeBytes) / gb
+	return float64(usedBytes) / gb, float64(freeBytesAvailable) / gb
 }

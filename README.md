@@ -142,6 +142,12 @@ GoReleaser (`.goreleaser.yaml`) builds `taurus-relay` for:
 - windows/amd64
 - windows/arm64
 
+Current support notes:
+
+- **Linux**: fully supported for both `connect` and `node` mode.
+- **macOS**: supported for `connect`; `node` mode is not a normal deployment target because it depends on Docker-based Taurus container hosting on Linux.
+- **Windows**: release binaries are built and published, but interactive `connect` sessions may require an explicit shell (for example `powershell.exe`) instead of assuming `bash`. The current Taurus control plane commonly requests `bash` for relay shell sessions, so native Windows `connect` support should still be treated as provisional until the control plane can request a Windows-appropriate shell. `node` mode should also be treated as experimental unless/until it is validated end-to-end on native Windows hosts.
+
 ### How to cut a release
 
 1. Merge your changes to `main`.

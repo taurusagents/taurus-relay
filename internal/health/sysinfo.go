@@ -47,8 +47,8 @@ func NodeSysInfo(sessionCount int, dataPath string, containerCount int) *protoco
 
 // NodeAllocatable returns total system memory (GB) and logical CPU count.
 func NodeAllocatable() (float64, int) {
-	totalKB, _ := memoryTotalsKB()
-	return float64(totalKB) / (1024 * 1024), runtime.NumCPU()
+	totalBytes := totalPhysicalMemoryBytes()
+	return float64(totalBytes) / (1024 * 1024 * 1024), runtime.NumCPU()
 }
 
 func memoryUsageGB() (usedGB, availableGB float64) {
