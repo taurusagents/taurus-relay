@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/release [major|minor|patch] [--dry-run]
+
+Creates the next annotated semver tag and pushes it to origin, which triggers
+GitHub Actions to publish the GitHub Release.
+
+Defaults to: minor
+
+Behavior:
+- requires a clean working tree
+- requires running on branch main
+- fetches origin/main and tags
+- fast-forwards local main if behind origin/main
+- pushes local main first if it is ahead of origin/main
+- bumps the latest stable vX.Y.Z tag
+
+Examples:
+  ./scripts/release
+  ./scripts/release minor
+  ./scripts/release patch --dry-run
+EOF
+}
+
+fail() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+bump_kind="minor"
+dry_run=0
+seen_bump_kind=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    major|minor|patch)
+      if [ "$seen_bump_kind" -eq 1 ]; then
+        fail "bump kind specified more than once"
+      fi
+      bump_kind="$1"
+      seen_bump_kind=1
+      ;;
+    --dry-run)
+      dry_run=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      fail "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$repo_root" ] || fail "not inside a git repository"
+cd "$repo_root"
+
+current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ "$current_branch" = "main" ] || fail "release must be run from branch 'main' (current: ${current_branch:-detached HEAD})"
+
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+  fail "working tree is not clean; commit/stash/remove changes first"
+fi
+
+if ! git remote get-url origin >/dev/null 2>&1; then
+  fail "git remote 'origin' is not configured"
+fi
+
+echo "Fetching origin/main and tags..."
+git fetch origin main --tags
+
+local_head=$(git rev-parse HEAD)
+remote_head=$(git rev-parse origin/main)
+merge_base=$(git merge-base HEAD origin/main)
+
+if [ "$merge_base" != "$local_head" ] && [ "$merge_base" != "$remote_head" ]; then
+  fail "local main has diverged from origin/main; reconcile it manually before releasing"
+fi
+
+if [ "$local_head" != "$remote_head" ]; then
+  if [ "$merge_base" = "$local_head" ]; then
+    echo "Local main is behind origin/main; fast-forwarding..."
+    git merge --ff-only origin/main
+    local_head=$(git rev-parse HEAD)
+  else
+    echo "Local main is ahead of origin/main; will push main before tagging."
+  fi
+fi
+
+latest_tag=$(git tag -l 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+
+if [ -z "$latest_tag" ]; then
+  case "$bump_kind" in
+    major) next_tag="v1.0.0" ;;
+    minor) next_tag="v0.1.0" ;;
+    patch) next_tag="v0.0.1" ;;
+    *) fail "unsupported bump kind: $bump_kind" ;;
+  esac
+else
+  if [[ ! "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    fail "latest tag is not valid semver: $latest_tag"
+  fi
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+
+  case "$bump_kind" in
+    major)
+      major=$((major + 1))
+      minor=0
+      patch=0
+      ;;
+    minor)
+      minor=$((minor + 1))
+      patch=0
+      ;;
+    patch)
+      patch=$((patch + 1))
+      ;;
+    *)
+      fail "unsupported bump kind: $bump_kind"
+      ;;
+  esac
+
+  next_tag="v${major}.${minor}.${patch}"
+fi
+
+if git rev-parse --verify --quiet "refs/tags/$next_tag" >/dev/null; then
+  fail "tag already exists: $next_tag"
+fi
+
+echo "Latest stable tag: ${latest_tag:-<none>}"
+echo "Next release tag: $next_tag"
+
+if [ "$dry_run" -eq 1 ]; then
+  if [ "$local_head" != "$remote_head" ] && [ "$merge_base" != "$local_head" ]; then
+    echo "Would push local main to origin before tagging."
+  fi
+  echo "Would create annotated tag: $next_tag"
+  echo "Would push tag to origin, triggering the GitHub Release workflow."
+  exit 0
+fi
+
+if [ "$local_head" != "$remote_head" ] && [ "$merge_base" != "$local_head" ]; then
+  git push origin main
+fi
+
+git tag -a "$next_tag" -m "Release $next_tag"
+git push origin "$next_tag"
+
+echo "Created and pushed $next_tag. GitHub Actions will now build and publish the release."

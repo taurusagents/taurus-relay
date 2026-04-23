@@ -150,18 +150,47 @@ Current support notes:
 
 ### How to cut a release
 
-1. Merge your changes to `main`.
-2. Create and push a semantic version tag:
+Preferred one-command flow:
+
+```bash
+./scripts/release minor
+```
+
+That helper will:
+
+1. verify you are on a clean `main`
+2. fetch `origin/main` and tags
+3. fast-forward local `main` if needed
+4. push local `main` first if it is ahead of origin
+5. detect the latest stable `vX.Y.Z` tag
+6. bump the requested semver segment (`major`, `minor`, or `patch`)
+7. create an annotated tag
+8. push the tag to `origin`, triggering the Release workflow
+
+Examples:
+
+```bash
+./scripts/release minor
+./scripts/release patch
+./scripts/release major --dry-run
+```
+
+If there are no existing release tags yet, the helper starts from:
+
+- `minor` → `v0.1.0`
+- `patch` → `v0.0.1`
+- `major` → `v1.0.0`
+
+You can still push a tag manually if needed:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-3. Wait for the **Release** workflow to finish.
-4. Verify artifacts and `checksums.txt` in the GitHub Release page.
+After pushing the tag, wait for the **Release** workflow to finish and verify artifacts plus `checksums.txt` on the GitHub Release page.
 
-Optional local dry-run:
+Optional local GoReleaser dry-run:
 
 ```bash
 goreleaser release --snapshot --clean
