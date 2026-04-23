@@ -1,2 +1,5 @@
 taurus-relay
 taurus-relay.exe
+dist/
+dist-ci/
+

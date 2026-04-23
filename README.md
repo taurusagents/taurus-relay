@@ -114,11 +114,60 @@ Build all packages:
 go build ./...
 ```
 
-Run tests (if/when present):
+Run tests:
 
 ```bash
 go test ./...
 ```
+
+## CI/CD and releases
+
+This repo ships with two GitHub Actions workflows:
+
+- **CI** (`.github/workflows/ci.yml`) on pushes to `main` and pull requests:
+  - `go test ./...`
+  - cross-compile checks for `linux/darwin/windows` on `amd64/arm64`
+- **Release** (`.github/workflows/release.yml`) on tags matching `v*`:
+  - runs GoReleaser
+  - publishes a GitHub Release with archives + checksums
+
+### Release artifacts
+
+GoReleaser (`.goreleaser.yaml`) builds `taurus-relay` for:
+
+- linux/amd64
+- linux/arm64
+- darwin/amd64
+- darwin/arm64
+- windows/amd64
+- windows/arm64
+
+### How to cut a release
+
+1. Merge your changes to `main`.
+2. Create and push a semantic version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+3. Wait for the **Release** workflow to finish.
+4. Verify artifacts and `checksums.txt` in the GitHub Release page.
+
+Optional local dry-run:
+
+```bash
+goreleaser release --snapshot --clean
+```
+
+### Required GitHub settings
+
+In the GitHub repository settings:
+
+- **Actions** must be enabled.
+- Workflows must be allowed to create releases with `contents: write` permission.
+  - If your org/repo policy restricts token permissions, allow **Read and write** workflow permissions for this repo.
 
 ## Notes
 
