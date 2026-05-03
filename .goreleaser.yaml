@@ -22,6 +22,7 @@ archives:
   - id: relay-archives
     ids:
       - taurus-relay
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         formats:

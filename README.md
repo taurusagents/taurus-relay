@@ -47,6 +47,46 @@ Or install directly:
 go install github.com/taurusagents/taurus-relay@latest
 ```
 
+## Quick install via public scripts
+
+These are the public bootstrap scripts intended to be served at:
+
+- `https://get.taurus.cloud/relay` → `scripts/install.sh`
+- `https://get.taurus.cloud/relay.ps1` → `scripts/install.ps1`
+
+Both installers download the latest GitHub release artifact for the current platform,
+verify it against `checksums.txt`, install the binary locally, and then run
+`taurus-relay connect`.
+
+Because they use GitHub's stable `releases/latest/download/...` URLs, cut a fresh
+relay release after merging these installer changes before wiring `get.taurus.cloud`
+to them in production.
+
+### Environment variables
+
+- `TAURUS_TOKEN` — one-time registration token from the Taurus UI
+- `TAURUS_URL` — Taurus app/control-plane base URL (defaults to `https://app.taurus.cloud`)
+
+Optional advanced overrides:
+
+- `TAURUS_RELAY_VERSION` — exact release tag to install instead of `latest`
+- `TAURUS_INSTALL_DIR` — custom install directory
+- `TAURUS_RELAY_SKIP_CONNECT=1` — install only, do not immediately run `connect`
+
+### Linux / macOS
+
+```bash
+curl -fsSL https://get.taurus.cloud/relay | TAURUS_TOKEN=<registration-token> TAURUS_URL=https://app.taurus.cloud sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+$env:TAURUS_TOKEN='<registration-token>'; $env:TAURUS_URL='https://app.taurus.cloud'; $installer = Join-Path $env:TEMP 'install-taurus-relay.ps1'; Invoke-WebRequest https://get.taurus.cloud/relay.ps1 -OutFile $installer; powershell -ExecutionPolicy Bypass -File $installer
+```
+
+For self-hosted Taurus, replace `TAURUS_URL` with your public Taurus app URL.
+
 ## Usage
 
 ### Show help
@@ -64,6 +104,9 @@ First connection with a one-time registration token:
   --server https://your-taurus-host.example \
   --token <registration-token>
 ```
+
+If you installed via the public bootstrap script, the installer runs this command for
+you after downloading the correct release binary.
 
 Subsequent reconnects reuse saved credentials:
 
@@ -147,6 +190,7 @@ Current support notes:
 - **Linux**: fully supported for both `connect` and `node` mode.
 - **macOS**: supported for `connect`; `node` mode is not a normal deployment target because it depends on Docker-based Taurus container hosting on Linux.
 - **Windows**: release binaries are built and published, but interactive `connect` sessions may require an explicit shell (for example `powershell.exe`) instead of assuming `bash`. The current Taurus control plane commonly requests `bash` for relay shell sessions, so native Windows `connect` support should still be treated as provisional until the control plane can request a Windows-appropriate shell. `node` mode should also be treated as experimental unless/until it is validated end-to-end on native Windows hosts.
+- The public installers depend on the archive naming above staying stable as `taurus-relay_<version>_<os>_<arch>.(tar.gz|zip)` plus `checksums.txt`; `.goreleaser.yaml` now pins that explicitly.
 
 ### How to cut a release
 
@@ -207,5 +251,7 @@ In the GitHub repository settings:
 ## Notes
 
 This repository intentionally contains only the relay binary and its internal Go packages. It does **not** include the Taurus control plane / web app / daemon source code.
+
+Public install scripts live in [`scripts/install.sh`](./scripts/install.sh) and [`scripts/install.ps1`](./scripts/install.ps1). If you are wiring up `get.taurus.cloud`, serve or redirect `/relay` and `/relay.ps1` to those script contents.
 
 No license has been added yet.
