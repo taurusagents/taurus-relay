@@ -35,6 +35,13 @@ var taurusAgentCapabilityAllowlist = []string{
 	"SETFCAP",
 }
 
+var strictContainerHardeningTruthyValues = map[string]struct{}{
+	"1":    {},
+	"true": {},
+	"yes":  {},
+	"on":   {},
+}
+
 type Client struct {
 	DataPath string
 	UseInit  bool
@@ -95,6 +102,15 @@ func taurusContainerNetworkName() string {
 		return configuredName
 	}
 	return defaultTaurusContainerNetworkName
+}
+
+// Strict hardening enforcement is rollout-gated so operators can keep reusing
+// legacy containers during deployment, then explicitly enable fail/recreate
+// behavior later. Fresh container creation still uses the hardened settings.
+func strictTaurusContainerHardeningEnabled() bool {
+	configuredValue := strings.ToLower(strings.TrimSpace(os.Getenv("TAURUS_STRICT_CONTAINER_HARDENING")))
+	_, ok := strictContainerHardeningTruthyValues[configuredValue]
+	return ok
 }
 
 func buildTaurusManagedBridgeCreateArgs(networkName string) []string {
@@ -397,9 +413,14 @@ func normalizeContainerStatus(raw string) string {
 }
 
 func (c *Client) EnsureContainer(opts EnsureOptions) error {
-	networkName, err := c.ensureAgentNetwork()
-	if err != nil {
-		return fmt.Errorf("ensure Taurus agent network: %w", err)
+	strictHardening := strictTaurusContainerHardeningEnabled()
+	networkName := taurusContainerNetworkName()
+	if strictHardening {
+		var err error
+		networkName, err = c.ensureAgentNetwork()
+		if err != nil {
+			return fmt.Errorf("ensure Taurus agent network: %w", err)
+		}
 	}
 
 	inspect, err := c.inspectContainerHardening(opts.ContainerID)
@@ -410,7 +431,15 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	if inspect != nil {
 		status := normalizeContainerStatus(inspect.State.Status)
 		drift := describeTaurusContainerHardeningDrift(*inspect, networkName)
-		if len(drift) == 0 {
+		if len(drift) == 0 || !strictHardening {
+			if len(drift) > 0 {
+				log.Printf(
+					"[relay-node/docker] container.ensure reusing legacy container=%s status=%s with hardening drift while TAURUS_STRICT_CONTAINER_HARDENING is disabled: %s",
+					opts.ContainerID,
+					status,
+					strings.Join(drift, "; "),
+				)
+			}
 			if status == StatusRunning {
 				log.Printf("[relay-node/docker] container.ensure already running container=%s", opts.ContainerID)
 				return nil
@@ -450,6 +479,13 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 		if _, err := c.docker("rm", "-f", opts.ContainerID); err != nil {
 			log.Printf("[relay-node/docker] container.ensure remove failed container=%s: %v", opts.ContainerID, err)
 			return err
+		}
+	}
+
+	if !strictHardening {
+		networkName, err = c.ensureAgentNetwork()
+		if err != nil {
+			return fmt.Errorf("ensure Taurus agent network: %w", err)
 		}
 	}
 

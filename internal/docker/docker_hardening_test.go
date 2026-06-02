@@ -2,6 +2,8 @@ package docker
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,6 +49,28 @@ func TestBuildTaurusContainerHardeningArgs(t *testing.T) {
 		if got[base] != "--cap-add" || got[base+1] != capability {
 			t.Fatalf("capability pair %d mismatch: got %q %q want --cap-add %q (all args: %v)", i, got[base], got[base+1], capability, got)
 		}
+	}
+}
+
+func TestStrictTaurusContainerHardeningEnabled(t *testing.T) {
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "")
+	if strictTaurusContainerHardeningEnabled() {
+		t.Fatalf("expected strict hardening enforcement to default off")
+	}
+
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "true")
+	if !strictTaurusContainerHardeningEnabled() {
+		t.Fatalf("expected strict hardening enforcement to turn on for true")
+	}
+
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "1")
+	if !strictTaurusContainerHardeningEnabled() {
+		t.Fatalf("expected strict hardening enforcement to turn on for 1")
+	}
+
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "false")
+	if strictTaurusContainerHardeningEnabled() {
+		t.Fatalf("expected strict hardening enforcement to stay off for false")
 	}
 }
 
@@ -201,5 +225,80 @@ func TestValidateBindMounts(t *testing.T) {
 				t.Fatalf("unexpected error: got %q want %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestEnsureContainerRolloutSafeReusesExistingDriftedContainerWithoutNetworkValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "docker.log")
+	dockerPath := filepath.Join(tmpDir, "docker")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [ "$1" = "inspect" ] && [ "$2" = "--format" ] && [ "$3" = "{{json .}}" ] && [ "$4" = "taurus-agent-demo" ]; then
+  cat <<'JSON'
+{"Name":"/taurus-agent-demo","State":{"Status":"running"},"HostConfig":{"NetworkMode":"bridge","Privileged":true,"SecurityOpt":[],"CapDrop":[],"CapAdd":["CHOWN"]},"NetworkSettings":{"Networks":{"bridge":{}}}}
+JSON
+  exit 0
+fi
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
+  echo "network inspect should not be called" >&2
+  exit 1
+fi
+echo "unexpected docker args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake docker shim: %v", err)
+	}
+
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_DOCKER_LOG", logPath)
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "0")
+
+	client := NewClient(tmpDir)
+	if err := client.EnsureContainer(EnsureOptions{ContainerID: "taurus-agent-demo"}); err != nil {
+		t.Fatalf("expected rollout-safe ensure to reuse existing container, got %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake docker log: %v", err)
+	}
+	if strings.Contains(string(logBytes), "network inspect") {
+		t.Fatalf("expected rollout-safe reuse to skip network validation, got log %q", string(logBytes))
+	}
+}
+
+func TestEnsureContainerStrictModeStillValidatesExistingNetwork(t *testing.T) {
+	tmpDir := t.TempDir()
+	dockerPath := filepath.Join(tmpDir, "docker")
+	script := `#!/bin/sh
+if [ "$1" = "network" ] && [ "$2" = "inspect" ] && [ "$5" = "taurus-node-bridge" ]; then
+  cat <<'JSON'
+{"Name":"taurus-node-bridge","Driver":"bridge","Options":{"com.docker.network.bridge.enable_icc":"true"}}
+JSON
+  exit 0
+fi
+if [ "$1" = "inspect" ]; then
+  echo "container inspect should not be reached before strict network validation" >&2
+  exit 1
+fi
+echo "unexpected docker args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake docker shim: %v", err)
+	}
+
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TAURUS_STRICT_CONTAINER_HARDENING", "1")
+
+	client := NewClient(tmpDir)
+	err := client.EnsureContainer(EnsureOptions{ContainerID: "taurus-agent-demo"})
+	if err == nil {
+		t.Fatalf("expected strict ensure to reject mismatched existing network")
+	}
+	if !strings.Contains(err.Error(), "refusing to use pre-existing Docker network") {
+		t.Fatalf("unexpected strict ensure error: %v", err)
 	}
 }
