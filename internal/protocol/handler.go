@@ -12,7 +12,7 @@ type Handler struct {
 }
 
 // HandlerFunc processes a message and returns a response payload (or error).
-type HandlerFunc func(id string, payload json.RawMessage) (responseType string, responsePayload any, err error)
+type HandlerFunc func(msg *Message) (responseType string, responsePayload any, err error)
 
 // NewHandler creates a new message handler.
 func NewHandler() *Handler {
@@ -33,19 +33,21 @@ func (h *Handler) Handle(msg *Message) *Message {
 		log.Printf("[handler] unknown message type: %s (id=%s)", msg.Type, msg.ID)
 		errStr := fmt.Sprintf("unknown message type: %s", msg.Type)
 		return &Message{
-			ID:    msg.ID,
-			Type:  msg.Type + ".error",
-			Error: &errStr,
+			ID:       msg.ID,
+			Type:     msg.Type + ".error",
+			Error:    &errStr,
+			Priority: NormalizePriority(msg.Priority),
 		}
 	}
 
-	respType, respPayload, err := fn(msg.ID, msg.Payload)
+	respType, respPayload, err := fn(msg)
 	if err != nil {
 		errStr := err.Error()
 		return &Message{
-			ID:    msg.ID,
-			Type:  respType,
-			Error: &errStr,
+			ID:       msg.ID,
+			Type:     respType,
+			Error:    &errStr,
+			Priority: NormalizePriority(msg.Priority),
 		}
 	}
 
@@ -57,15 +59,17 @@ func (h *Handler) Handle(msg *Message) *Message {
 	if err != nil {
 		errStr := fmt.Sprintf("failed to marshal response: %v", err)
 		return &Message{
-			ID:    msg.ID,
-			Type:  respType,
-			Error: &errStr,
+			ID:       msg.ID,
+			Type:     respType,
+			Error:    &errStr,
+			Priority: NormalizePriority(msg.Priority),
 		}
 	}
 
 	return &Message{
-		ID:      msg.ID,
-		Type:    respType,
-		Payload: payloadBytes,
+		ID:       msg.ID,
+		Type:     respType,
+		Payload:  payloadBytes,
+		Priority: NormalizePriority(msg.Priority),
 	}
 }

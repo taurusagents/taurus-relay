@@ -35,6 +35,7 @@ type Session struct {
 	closed   bool
 	onOutput OutputCallback
 	onExit   ExitCallback
+	outputWG sync.WaitGroup
 
 	// For sentinel-based exec
 	execMu     sync.Mutex
@@ -101,6 +102,7 @@ func NewSession(id, shell string, args []string, cwd string, env map[string]stri
 	}
 
 	// Start reading output
+	sess.outputWG.Add(1)
 	go sess.readLoop()
 
 	// Wait for process exit
@@ -111,6 +113,7 @@ func NewSession(id, shell string, args []string, cwd string, env map[string]stri
 
 // readLoop continuously reads from the PTY and dispatches output.
 func (s *Session) readLoop() {
+	defer s.outputWG.Done()
 	buf := make([]byte, 8192)
 	for {
 		n, err := s.PTY.Read(buf)
@@ -157,6 +160,7 @@ func (s *Session) waitLoop() {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	s.outputWG.Wait()
 
 	if s.onExit != nil {
 		s.onExit(s.ID, exitCode)

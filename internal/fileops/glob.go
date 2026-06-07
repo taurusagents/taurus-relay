@@ -1,6 +1,7 @@
 package fileops
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,10 @@ import (
 
 // Glob finds files matching a pattern.
 func Glob(p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) {
+	return GlobContext(context.Background(), p)
+}
+
+func GlobContext(ctx context.Context, p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) {
 	cwd := p.CWD
 	if cwd == "" {
 		var err error
@@ -18,6 +23,10 @@ func Glob(p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) 
 		if err != nil {
 			cwd = "."
 		}
+	}
+
+	if err := checkContext(ctx); err != nil {
+		return nil, err
 	}
 
 	// Validate the base directory
@@ -28,9 +37,9 @@ func Glob(p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) 
 
 	pattern := p.Pattern
 
-	// If pattern contains **, we need recursive walk
+	// If pattern contains **, we need recursive walk.
 	if strings.Contains(pattern, "**") {
-		return globRecursive(cwd, pattern)
+		return globRecursiveContext(ctx, cwd, pattern)
 	}
 
 	// Simple glob
@@ -39,10 +48,16 @@ func Glob(p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
 
 	// Make paths relative to cwd
 	result := make([]string, 0, len(matches))
 	for _, m := range matches {
+		if _, err := ValidatePath(m); err != nil {
+			continue
+		}
 		rel, err := filepath.Rel(cwd, m)
 		if err != nil {
 			rel = m
@@ -54,10 +69,13 @@ func Glob(p *protocol.FileGlobPayload) (*protocol.FileGlobResultPayload, error) 
 	return &protocol.FileGlobResultPayload{Paths: result}, nil
 }
 
-func globRecursive(root, pattern string) (*protocol.FileGlobResultPayload, error) {
+func globRecursiveContext(ctx context.Context, root, pattern string) (*protocol.FileGlobResultPayload, error) {
 	var result []string
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil // skip errors
 		}
@@ -80,6 +98,9 @@ func globRecursive(root, pattern string) (*protocol.FileGlobResultPayload, error
 			return nil
 		}
 		if matched {
+			if _, err := ValidatePath(path); err != nil {
+				return nil
+			}
 			result = append(result, rel)
 		}
 		return nil

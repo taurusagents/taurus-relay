@@ -1,6 +1,7 @@
 package fileops
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,18 @@ import (
 // Set during initialization (e.g., to the user's home directory).
 // If empty, no restrictions are applied.
 var AllowedRoots []string
+
+func checkContext(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
 
 // expandPath expands ~ to home directory and resolves relative paths.
 func expandPath(p string) string {
@@ -35,13 +48,10 @@ func ValidatePath(path string) (string, error) {
 	// Resolve symlinks
 	resolved, err := filepath.EvalSymlinks(expanded)
 	if err != nil {
-		// File might not exist yet (for writes) — resolve parent dir
-		dir := filepath.Dir(expanded)
-		resolvedDir, err2 := filepath.EvalSymlinks(dir)
-		if err2 != nil {
-			return "", fmt.Errorf("cannot resolve path: %w", err2)
+		resolved, err = resolvePathFromExistingAncestor(expanded)
+		if err != nil {
+			return "", err
 		}
-		resolved = filepath.Join(resolvedDir, filepath.Base(expanded))
 	}
 
 	if len(AllowedRoots) == 0 {
@@ -54,4 +64,24 @@ func ValidatePath(path string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("path %q is outside allowed roots", path)
+}
+
+func resolvePathFromExistingAncestor(path string) (string, error) {
+	current := path
+	remainder := []string{}
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(remainder) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, remainder[i])
+			}
+			return resolved, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("cannot resolve path: %w", err)
+		}
+		remainder = append(remainder, filepath.Base(current))
+		current = parent
+	}
 }

@@ -5,14 +5,31 @@ import "encoding/json"
 
 // Message is the envelope for all WebSocket communication.
 type Message struct {
-	ID      string          `json:"id"`
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-	Error   *string         `json:"error,omitempty"`
+	ID       string          `json:"id"`
+	Type     string          `json:"type"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	Error    *string         `json:"error,omitempty"`
+	Priority string          `json:"priority,omitempty"`
+	// Generation is relay-local metadata used to bind already-read requests to the
+	// runtime generation that received them. It is never serialized on the wire.
+	Generation uint64 `json:"-"`
 }
 
 // ErrorString returns a non-nil error string pointer.
 func ErrorString(s string) *string { return &s }
+
+const (
+	PriorityNormal   = "normal"
+	PriorityPriority = "priority"
+)
+
+// NormalizePriority collapses unknown values back to the default normal lane.
+func NormalizePriority(priority string) string {
+	if priority == PriorityPriority {
+		return PriorityPriority
+	}
+	return PriorityNormal
+}
 
 // --- Shell message payloads ---
 
@@ -63,6 +80,80 @@ type ShellOutputPayload struct {
 }
 
 type ShellExitPayload struct {
+	SessionID string `json:"session_id"`
+	ExitCode  int    `json:"exit_code"`
+}
+
+// --- Proc message payloads ---
+
+type ProcRunPayload struct {
+	// RunID lets Taurus provide a stable cancel handle without coupling proc.cancel
+	// to the outer transport envelope's message ID.
+	RunID     string            `json:"run_id,omitempty"`
+	Argv      []string          `json:"argv"`
+	CWD       string            `json:"cwd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Stdin     string            `json:"stdin,omitempty"`
+	TimeoutMs int               `json:"timeout_ms,omitempty"`
+}
+
+type ProcRunResultPayload struct {
+	// Stdout/Stderr are convenience text fields populated only when the captured
+	// bytes are valid UTF-8. Use StdoutBase64/StderrBase64 for exact bytes.
+	Stdout       string `json:"stdout"`
+	StdoutBase64 string `json:"stdout_b64,omitempty"`
+	Stderr       string `json:"stderr"`
+	StderrBase64 string `json:"stderr_b64,omitempty"`
+	ExitCode     int    `json:"exit_code"`
+	DurationMs   int64  `json:"duration_ms"`
+	TimedOut     bool   `json:"timed_out,omitempty"`
+	Canceled     bool   `json:"canceled,omitempty"`
+}
+
+type ProcCancelPayload struct {
+	RunID string `json:"run_id,omitempty"`
+	// RequestID remains as a narrow transitional fallback for older Taurus calls
+	// that still key one-shot cancellation off the transport envelope ID.
+	RequestID string `json:"request_id,omitempty"`
+}
+
+type ProcSpawnPayload struct {
+	SessionID string            `json:"session_id"`
+	Argv      []string          `json:"argv"`
+	CWD       string            `json:"cwd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Pty       bool              `json:"pty,omitempty"`
+	Cols      uint16            `json:"cols,omitempty"`
+	Rows      uint16            `json:"rows,omitempty"`
+}
+
+type ProcStdinPayload struct {
+	SessionID string `json:"session_id"`
+	Data      string `json:"data"`
+}
+
+type ProcResizePayload struct {
+	SessionID string `json:"session_id"`
+	Cols      uint16 `json:"cols"`
+	Rows      uint16 `json:"rows"`
+}
+
+type ProcSignalPayload struct {
+	SessionID string `json:"session_id"`
+	Signal    string `json:"signal"`
+}
+
+type ProcKillPayload struct {
+	SessionID string `json:"session_id"`
+}
+
+type ProcOutputPayload struct {
+	SessionID string `json:"session_id"`
+	Stream    string `json:"stream"`
+	Data      string `json:"data"`
+}
+
+type ProcExitPayload struct {
 	SessionID string `json:"session_id"`
 	ExitCode  int    `json:"exit_code"`
 }
@@ -285,6 +376,25 @@ const (
 	TypeShellSignal     = "shell.signal"
 	TypeShellOutput     = "shell.output"
 	TypeShellExit       = "shell.exit"
+
+	TypeProcRun              = "proc.run"
+	TypeProcRunResult        = "proc.run.result"
+	TypeProcCancel           = "proc.cancel"
+	TypeProcCancelResult     = "proc.cancel.result"
+	TypeProcSpawn            = "proc.spawn"
+	TypeProcSpawnResult      = "proc.spawn.result"
+	TypeProcOutput           = "proc.output"
+	TypeProcExit             = "proc.exit"
+	TypeProcStdin            = "proc.stdin"
+	TypeProcStdinResult      = "proc.stdin.result"
+	TypeProcResize           = "proc.resize"
+	TypeProcResizeResult     = "proc.resize.result"
+	TypeProcSignal           = "proc.signal"
+	TypeProcSignalResult     = "proc.signal.result"
+	TypeProcKill             = "proc.kill"
+	TypeProcKillResult       = "proc.kill.result"
+	TypeProcCheckAlive       = "proc.check_alive"
+	TypeProcCheckAliveResult = "proc.check_alive.result"
 
 	TypeFileRead         = "file.read"
 	TypeFileReadResult   = "file.read.result"

@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -48,10 +49,32 @@ func NewClient(dataPath string) *Client {
 	return &Client{DataPath: dataPath, UseInit: true}
 }
 
+func checkContext(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
 func (c *Client) docker(args ...string) (string, error) {
-	cmd := exec.Command("docker", args...)
+	return c.dockerWithContext(context.Background(), args...)
+}
+
+func (c *Client) dockerWithContext(ctx context.Context, args ...string) (string, error) {
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := checkContext(ctx); ctxErr != nil {
+			return "", ctxErr
+		}
 		msg := strings.TrimSpace(string(out))
 		if msg != "" {
 			return "", fmt.Errorf("docker %s: %s", strings.Join(args, " "), msg)
@@ -62,7 +85,11 @@ func (c *Client) docker(args ...string) (string, error) {
 }
 
 func (c *Client) ContainerStatus(containerID string) (string, error) {
-	status, err := c.docker("inspect", "--format", "{{.State.Status}}", containerID)
+	return c.ContainerStatusContext(context.Background(), containerID)
+}
+
+func (c *Client) ContainerStatusContext(ctx context.Context, containerID string) (string, error) {
+	status, err := c.dockerWithContext(ctx, "inspect", "--format", "{{.State.Status}}", containerID)
 	if err != nil {
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "no such object") || strings.Contains(errText, "no such container") {
@@ -81,7 +108,11 @@ func (c *Client) ContainerStatus(containerID string) (string, error) {
 }
 
 func (c *Client) EnsureContainer(opts EnsureOptions) error {
-	status, err := c.ContainerStatus(opts.ContainerID)
+	return c.EnsureContainerContext(context.Background(), opts)
+}
+
+func (c *Client) EnsureContainerContext(ctx context.Context, opts EnsureOptions) error {
+	status, err := c.ContainerStatusContext(ctx, opts.ContainerID)
 	if err != nil {
 		log.Printf("[relay-node/docker] container.ensure status lookup failed container=%s: %v", opts.ContainerID, err)
 		return err
@@ -95,14 +126,14 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	if status != StatusNotFound {
 		if status == StatusPaused {
 			log.Printf("[relay-node/docker] container.ensure unpausing existing container=%s", opts.ContainerID)
-			_, err := c.docker("unpause", opts.ContainerID)
+			_, err := c.dockerWithContext(ctx, "unpause", opts.ContainerID)
 			if err != nil {
 				log.Printf("[relay-node/docker] container.ensure unpause failed container=%s: %v", opts.ContainerID, err)
 			}
 			return err
 		}
 		log.Printf("[relay-node/docker] container.ensure starting existing container=%s status=%s", opts.ContainerID, status)
-		if _, err := c.docker("start", opts.ContainerID); err != nil {
+		if _, err := c.dockerWithContext(ctx, "start", opts.ContainerID); err != nil {
 			log.Printf("[relay-node/docker] container.ensure start failed container=%s: %v", opts.ContainerID, err)
 			return err
 		}
@@ -112,6 +143,9 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	if opts.Image == "" {
 		return fmt.Errorf("image is required")
 	}
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
 
 	workspacePath := filepath.Join(c.DataPath, "taurus-drives", opts.UserID, opts.AgentID, "workspace")
 	sharedPath := filepath.Join(c.DataPath, "taurus-drives", opts.UserID, opts.RootAgentID, "shared")
@@ -120,6 +154,9 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 	}
 	if err := os.MkdirAll(sharedPath, 0o755); err != nil {
 		return fmt.Errorf("create shared path: %w", err)
+	}
+	if err := checkContext(ctx); err != nil {
+		return err
 	}
 
 	createArgs := []string{"create", "--name", opts.ContainerID, "-w", "/workspace"}
@@ -154,11 +191,11 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 		opts.ContainerID, opts.Image, opts.UserID, opts.AgentID, opts.RootAgentID, len(opts.Mounts),
 		opts.ResourceLimits.CPUs, opts.ResourceLimits.MemoryMB, opts.ResourceLimits.PidsLimit,
 	)
-	if _, err := c.docker(createArgs...); err != nil {
+	if _, err := c.dockerWithContext(ctx, createArgs...); err != nil {
 		log.Printf("[relay-node/docker] container.ensure create failed container=%s: %v", opts.ContainerID, err)
 		return err
 	}
-	if _, err := c.docker("start", opts.ContainerID); err != nil {
+	if _, err := c.dockerWithContext(ctx, "start", opts.ContainerID); err != nil {
 		log.Printf("[relay-node/docker] container.ensure start failed container=%s: %v", opts.ContainerID, err)
 		return err
 	}
@@ -167,14 +204,18 @@ func (c *Client) EnsureContainer(opts EnsureOptions) error {
 }
 
 func (c *Client) Pause(containerID string) error {
-	status, err := c.ContainerStatus(containerID)
+	return c.PauseContext(context.Background(), containerID)
+}
+
+func (c *Client) PauseContext(ctx context.Context, containerID string) error {
+	status, err := c.ContainerStatusContext(ctx, containerID)
 	if err != nil {
 		log.Printf("[relay-node/docker] container.pause status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusRunning {
 		log.Printf("[relay-node/docker] container.pause container=%s", containerID)
-		_, err = c.docker("pause", containerID)
+		_, err = c.dockerWithContext(ctx, "pause", containerID)
 	}
 	if err != nil {
 		log.Printf("[relay-node/docker] container.pause failed container=%s: %v", containerID, err)
@@ -183,14 +224,18 @@ func (c *Client) Pause(containerID string) error {
 }
 
 func (c *Client) Unpause(containerID string) error {
-	status, err := c.ContainerStatus(containerID)
+	return c.UnpauseContext(context.Background(), containerID)
+}
+
+func (c *Client) UnpauseContext(ctx context.Context, containerID string) error {
+	status, err := c.ContainerStatusContext(ctx, containerID)
 	if err != nil {
 		log.Printf("[relay-node/docker] container.unpause status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusPaused {
 		log.Printf("[relay-node/docker] container.unpause container=%s", containerID)
-		_, err = c.docker("unpause", containerID)
+		_, err = c.dockerWithContext(ctx, "unpause", containerID)
 	}
 	if err != nil {
 		log.Printf("[relay-node/docker] container.unpause failed container=%s: %v", containerID, err)
@@ -199,14 +244,18 @@ func (c *Client) Unpause(containerID string) error {
 }
 
 func (c *Client) Stop(containerID string) error {
-	status, err := c.ContainerStatus(containerID)
+	return c.StopContext(context.Background(), containerID)
+}
+
+func (c *Client) StopContext(ctx context.Context, containerID string) error {
+	status, err := c.ContainerStatusContext(ctx, containerID)
 	if err != nil {
 		log.Printf("[relay-node/docker] container.stop status failed container=%s: %v", containerID, err)
 		return err
 	}
 	if status == StatusRunning || status == StatusPaused {
 		log.Printf("[relay-node/docker] container.stop container=%s status=%s", containerID, status)
-		_, err = c.docker("stop", "-t", "5", containerID)
+		_, err = c.dockerWithContext(ctx, "stop", "-t", "5", containerID)
 	}
 	if err != nil {
 		log.Printf("[relay-node/docker] container.stop failed container=%s: %v", containerID, err)
@@ -215,8 +264,12 @@ func (c *Client) Stop(containerID string) error {
 }
 
 func (c *Client) Destroy(containerID string) error {
+	return c.DestroyContext(context.Background(), containerID)
+}
+
+func (c *Client) DestroyContext(ctx context.Context, containerID string) error {
 	log.Printf("[relay-node/docker] container.destroy container=%s", containerID)
-	_, err := c.docker("rm", "-f", containerID)
+	_, err := c.dockerWithContext(ctx, "rm", "-f", containerID)
 	if err != nil {
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "no such object") || strings.Contains(errText, "no such container") {
@@ -228,9 +281,13 @@ func (c *Client) Destroy(containerID string) error {
 }
 
 func (c *Client) ExecCommand(containerID string, command []string) (string, error) {
+	return c.ExecCommandContext(context.Background(), containerID, command)
+}
+
+func (c *Client) ExecCommandContext(ctx context.Context, containerID string, command []string) (string, error) {
 	args := append([]string{"exec", containerID}, command...)
 	log.Printf("[relay-node/docker] exec_command container=%s command=%v", containerID, command)
-	out, err := c.docker(args...)
+	out, err := c.dockerWithContext(ctx, args...)
 	if err != nil {
 		log.Printf("[relay-node/docker] exec_command failed container=%s: %v", containerID, err)
 		return "", err
@@ -239,12 +296,22 @@ func (c *Client) ExecCommand(containerID string, command []string) (string, erro
 }
 
 func (c *Client) ExecWithStdin(containerID string, command []string, stdin string) (string, error) {
+	return c.ExecWithStdinContext(context.Background(), containerID, command, stdin)
+}
+
+func (c *Client) ExecWithStdinContext(ctx context.Context, containerID string, command []string, stdin string) (string, error) {
 	args := append([]string{"exec", "-i", containerID}, command...)
 	log.Printf("[relay-node/docker] exec_with_stdin container=%s command=%v stdin_len=%d", containerID, command, len(stdin))
-	cmd := exec.Command("docker", args...)
+	if err := checkContext(ctx); err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := checkContext(ctx); ctxErr != nil {
+			return "", ctxErr
+		}
 		msg := strings.TrimSpace(string(out))
 		log.Printf("[relay-node/docker] exec_with_stdin failed container=%s: %s", containerID, msg)
 		return "", fmt.Errorf("docker exec: %s", msg)

@@ -2,6 +2,7 @@ package fileops
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,9 +18,17 @@ const maxGrepMatches = 500
 
 // Grep searches file contents using regex. Uses ripgrep if available, falls back to Go.
 func Grep(p *protocol.FileGrepPayload) (*protocol.FileGrepResultPayload, error) {
+	return GrepContext(context.Background(), p)
+}
+
+func GrepContext(ctx context.Context, p *protocol.FileGrepPayload) (*protocol.FileGrepResultPayload, error) {
 	searchPath := p.Path
 	if searchPath == "" {
 		searchPath = "."
+	}
+
+	if err := checkContext(ctx); err != nil {
+		return nil, err
 	}
 
 	// Validate the search path
@@ -30,14 +39,14 @@ func Grep(p *protocol.FileGrepPayload) (*protocol.FileGrepResultPayload, error) 
 
 	// Try ripgrep first
 	if rgPath, err := exec.LookPath("rg"); err == nil {
-		return grepRipgrep(rgPath, p.Pattern, searchPath, p.Glob)
+		return grepRipgrepContext(ctx, rgPath, p.Pattern, searchPath, p.Glob)
 	}
 
 	// Fallback to Go regex
-	return grepGo(p.Pattern, searchPath, p.Glob)
+	return grepGoContext(ctx, p.Pattern, searchPath, p.Glob)
 }
 
-func grepRipgrep(rgPath, pattern, searchPath, glob string) (*protocol.FileGrepResultPayload, error) {
+func grepRipgrepContext(ctx context.Context, rgPath, pattern, searchPath, glob string) (*protocol.FileGrepResultPayload, error) {
 	args := []string{
 		"--line-number",
 		"--no-heading",
@@ -49,9 +58,12 @@ func grepRipgrep(rgPath, pattern, searchPath, glob string) (*protocol.FileGrepRe
 	}
 	args = append(args, pattern, searchPath)
 
-	cmd := exec.Command(rgPath, args...)
+	cmd := exec.CommandContext(ctx, rgPath, args...)
 	out, err := cmd.Output()
 	if err != nil {
+		if ctxErr := checkContext(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
 		// rg returns exit code 1 for no matches
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return &protocol.FileGrepResultPayload{Matches: []protocol.GrepMatch{}}, nil
@@ -65,6 +77,9 @@ func grepRipgrep(rgPath, pattern, searchPath, glob string) (*protocol.FileGrepRe
 	var matches []protocol.GrepMatch
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() && len(matches) < maxGrepMatches {
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
 		line := scanner.Text()
 		// Format: file:line:text
 		parts := strings.SplitN(line, ":", 3)
@@ -85,7 +100,7 @@ func grepRipgrep(rgPath, pattern, searchPath, glob string) (*protocol.FileGrepRe
 	return &protocol.FileGrepResultPayload{Matches: matches}, nil
 }
 
-func grepGo(pattern, searchPath, globFilter string) (*protocol.FileGrepResultPayload, error) {
+func grepGoContext(ctx context.Context, pattern, searchPath, globFilter string) (*protocol.FileGrepResultPayload, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex: %w", err)
@@ -94,6 +109,9 @@ func grepGo(pattern, searchPath, globFilter string) (*protocol.FileGrepResultPay
 	var matches []protocol.GrepMatch
 
 	err = filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
 		if err != nil || info.IsDir() {
 			if info != nil && info.IsDir() {
 				base := info.Name()
@@ -130,6 +148,9 @@ func grepGo(pattern, searchPath, globFilter string) (*protocol.FileGrepResultPay
 		scanner := bufio.NewScanner(f)
 		lineNum := 0
 		for scanner.Scan() && len(matches) < maxGrepMatches {
+			if err := checkContext(ctx); err != nil {
+				return err
+			}
 			lineNum++
 			text := scanner.Text()
 			if re.MatchString(text) {

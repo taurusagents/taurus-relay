@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/taurusagents/taurus-relay/internal/docker"
 	"github.com/taurusagents/taurus-relay/internal/fileops"
 	"github.com/taurusagents/taurus-relay/internal/health"
+	"github.com/taurusagents/taurus-relay/internal/proc"
 	"github.com/taurusagents/taurus-relay/internal/protocol"
 	"github.com/taurusagents/taurus-relay/internal/shell"
 )
@@ -34,6 +38,7 @@ const (
 	sessionQueueMaxMessages    = 128
 	sessionQueueMaxBytes       = 1024 * 1024 // 1 MiB per session
 	containerExecReapTimeoutMs = 3000
+	priorityBurstLimit         = 8 // let normal traffic through after a short priority burst
 )
 
 type queuedOutput struct {
@@ -42,10 +47,14 @@ type queuedOutput struct {
 }
 
 type sessionOutputQueue struct {
-	items  []queuedOutput
-	bytes  int
-	full   *sync.Cond
-	active bool
+	items          []queuedOutput
+	bytes          int
+	full           *sync.Cond
+	active         bool
+	closed         bool
+	drainWhenEmpty bool
+	writers        int
+	priority       string
 }
 
 type NodeOptions struct {
@@ -55,6 +64,28 @@ type NodeOptions struct {
 	DataPath      string
 	MaxContainers int
 }
+
+// runtimeSnapshot captures the runtime-bound objects a request is allowed to
+// use. Requests read from an older websocket generation keep using this
+// snapshot so they cannot accidentally hop onto the fresh runtime created after
+// a reconnect/reset.
+type runtimeSnapshot struct {
+	ctx    context.Context
+	shells *shell.Multiplexer
+	execs  *docker.ExecMultiplexer
+	procs  *proc.Multiplexer
+}
+
+type procRunCancelHandleKey struct {
+	generation uint64
+	cancelID   string
+}
+
+type procRunCancelEntry struct {
+	cancel func(error)
+}
+
+var procRunCanceledCause = errors.New("proc.run canceled")
 
 // Tunnel manages the WebSocket connection and message routing.
 type Tunnel struct {
@@ -70,19 +101,48 @@ type Tunnel struct {
 
 	shells *shell.Multiplexer
 	execs  *docker.ExecMultiplexer
+	procs  *proc.Multiplexer
 	docker *docker.Client
 
-	controlQ chan *protocol.Message
+	priorityControlQ chan *protocol.Message
+	normalControlQ   chan *protocol.Message
 
-	outputMu      sync.Mutex
-	outputQueues  map[string]*sessionOutputQueue
-	activeOutputs []string
-	rrIndex       int
-	outputReady   chan struct{}
+	outputMu                sync.Mutex
+	outputQueues            map[string]*sessionOutputQueue
+	completedOutputSessions map[string]struct{}
+	activePriorityOutputs   []string
+	activeNormalOutputs     []string
+	priorityRRIndex         int
+	normalRRIndex           int
+	outputReady             chan struct{}
+	runtimeGeneration       atomic.Uint64
+	runtimeMu               sync.RWMutex
+	runtimeCtx              context.Context
+	runtimeCancel           context.CancelFunc
+	procRunMu               sync.Mutex
+	procRunCancels          map[procRunCancelHandleKey]procRunCancelEntry
 
 	stopCh chan struct{}
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+type outputSessionNamespace string
+
+const (
+	outputSessionNamespaceShell         outputSessionNamespace = "shell"
+	outputSessionNamespaceProc          outputSessionNamespace = "proc"
+	outputSessionNamespaceContainerExec outputSessionNamespace = "container.exec"
+)
+
+func outputSessionQueueKey(namespace outputSessionNamespace, sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	// Queue state is shared across all streamed APIs in a tunnel. Scope it by API
+	// family so proc/container.exec/shell can safely reuse the same bare
+	// session_id without inheriting each other's buffered-output completion state.
+	return string(namespace) + "\x00" + sessionID
 }
 
 // New creates a new Tunnel for user relay mode.
@@ -98,25 +158,223 @@ func NewNode(server string, opts NodeOptions) *Tunnel {
 
 func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOptions) *Tunnel {
 	ctx, cancel := context.WithCancel(context.Background())
+	runtimeCtx, runtimeCancel := context.WithCancel(ctx)
 
 	t := &Tunnel{
-		cfg:       cfg,
-		token:     token,
-		reconnCfg: DefaultReconnectConfig(),
-		mode:      mode,
-		node:      nodeOpts,
-		handler:   protocol.NewHandler(),
-		controlQ:  make(chan *protocol.Message, controlQueueSize),
+		cfg:              cfg,
+		token:            token,
+		reconnCfg:        DefaultReconnectConfig(),
+		mode:             mode,
+		node:             nodeOpts,
+		handler:          protocol.NewHandler(),
+		priorityControlQ: make(chan *protocol.Message, controlQueueSize),
+		normalControlQ:   make(chan *protocol.Message, controlQueueSize),
 
-		outputQueues: make(map[string]*sessionOutputQueue),
-		outputReady:  make(chan struct{}, 1),
+		outputQueues:            make(map[string]*sessionOutputQueue),
+		completedOutputSessions: make(map[string]struct{}),
+		outputReady:             make(chan struct{}, 1),
+		procRunCancels:          make(map[procRunCancelHandleKey]procRunCancelEntry),
 
 		stopCh: make(chan struct{}),
 		ctx:    ctx,
 		cancel: cancel,
+
+		runtimeCtx:    runtimeCtx,
+		runtimeCancel: runtimeCancel,
 	}
 
-	if mode == ModeConnect {
+	t.runtimeGeneration.Store(1)
+	t.rebuildRuntimeMultiplexers(t.currentRuntimeGeneration())
+
+	t.registerHandlers(mode)
+	return t
+}
+
+func (t *Tunnel) currentRuntimeGeneration() uint64 {
+	return t.runtimeGeneration.Load()
+}
+
+func (t *Tunnel) requestGeneration(msg *protocol.Message) uint64 {
+	if msg != nil && msg.Generation != 0 {
+		return msg.Generation
+	}
+	return t.currentRuntimeGeneration()
+}
+
+func (t *Tunnel) rememberProcRunCancel(cancelID string, generation uint64, cancel func(error)) error {
+	if cancelID == "" || cancel == nil {
+		return nil
+	}
+	key := procRunCancelHandleKey{generation: generation, cancelID: cancelID}
+	t.procRunMu.Lock()
+	defer t.procRunMu.Unlock()
+	if _, exists := t.procRunCancels[key]; exists {
+		return fmt.Errorf("proc run %q already active", cancelID)
+	}
+	t.procRunCancels[key] = procRunCancelEntry{cancel: cancel}
+	return nil
+}
+
+func (t *Tunnel) forgetProcRunCancel(cancelID string, generation uint64) {
+	if cancelID == "" {
+		return
+	}
+	t.procRunMu.Lock()
+	delete(t.procRunCancels, procRunCancelHandleKey{generation: generation, cancelID: cancelID})
+	t.procRunMu.Unlock()
+}
+
+func (t *Tunnel) cancelProcRun(cancelID string, generation uint64) bool {
+	if cancelID == "" {
+		return false
+	}
+	key := procRunCancelHandleKey{generation: generation, cancelID: cancelID}
+	t.procRunMu.Lock()
+	entry, ok := t.procRunCancels[key]
+	if ok {
+		delete(t.procRunCancels, key)
+	}
+	t.procRunMu.Unlock()
+	if !ok || entry.cancel == nil {
+		return false
+	}
+	entry.cancel(procRunCanceledCause)
+	return true
+}
+
+func procRunCancelID(runID, requestID string) string {
+	if runID != "" {
+		return runID
+	}
+	return requestID
+}
+
+func (t *Tunnel) markOutputSessionComplete(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	t.outputMu.Lock()
+	t.completedOutputSessions[sessionKey] = struct{}{}
+	if q := t.outputQueues[sessionKey]; q != nil {
+		q.drainWhenEmpty = true
+		t.maybeDeleteOutputQueueLocked(sessionKey, q)
+	}
+	t.outputMu.Unlock()
+}
+
+func (t *Tunnel) markOutputSessionCompleteFor(namespace outputSessionNamespace, sessionID string) {
+	t.markOutputSessionComplete(outputSessionQueueKey(namespace, sessionID))
+}
+
+func (t *Tunnel) maybeDeleteOutputQueueLocked(sessionKey string, q *sessionOutputQueue) {
+	if q == nil || q.active || len(q.items) != 0 || q.writers != 0 || !q.drainWhenEmpty {
+		return
+	}
+	if t.outputQueues[sessionKey] == q {
+		delete(t.outputQueues, sessionKey)
+	}
+	delete(t.completedOutputSessions, sessionKey)
+}
+
+func (t *Tunnel) outputSessionStateExists(namespace outputSessionNamespace, sessionID string) bool {
+	sessionKey := outputSessionQueueKey(namespace, sessionID)
+	if sessionKey == "" {
+		return false
+	}
+	t.outputMu.Lock()
+	defer t.outputMu.Unlock()
+	if _, ok := t.outputQueues[sessionKey]; ok {
+		return true
+	}
+	_, ok := t.completedOutputSessions[sessionKey]
+	return ok
+}
+
+func procRunResultPayload(result *proc.RunResult, canceled bool) *protocol.ProcRunResultPayload {
+	if result == nil {
+		return nil
+	}
+	stdoutText := ""
+	if utf8.ValidString(result.Stdout) {
+		stdoutText = result.Stdout
+	}
+	stderrText := ""
+	if utf8.ValidString(result.Stderr) {
+		stderrText = result.Stderr
+	}
+	return &protocol.ProcRunResultPayload{
+		Stdout:       stdoutText,
+		StdoutBase64: base64.StdEncoding.EncodeToString([]byte(result.Stdout)),
+		Stderr:       stderrText,
+		StderrBase64: base64.StdEncoding.EncodeToString([]byte(result.Stderr)),
+		ExitCode:     result.ExitCode,
+		DurationMs:   result.Duration.Milliseconds(),
+		TimedOut:     result.TimedOut,
+		Canceled:     canceled,
+	}
+}
+
+func (t *Tunnel) runtimeSnapshotForMessage(msg *protocol.Message) (runtimeSnapshot, error) {
+	generation := uint64(0)
+	if msg != nil {
+		generation = msg.Generation
+	}
+	return t.runtimeSnapshotForGeneration(generation)
+}
+
+func (t *Tunnel) runtimeSnapshotForGeneration(generation uint64) (runtimeSnapshot, error) {
+	t.runtimeMu.RLock()
+	defer t.runtimeMu.RUnlock()
+	if generation != 0 && generation != t.runtimeGeneration.Load() {
+		return runtimeSnapshot{}, context.Canceled
+	}
+	return runtimeSnapshot{
+		ctx:    t.runtimeCtx,
+		shells: t.shells,
+		execs:  t.execs,
+		procs:  t.procs,
+	}, nil
+}
+
+func (t *Tunnel) shellsForMessage(msg *protocol.Message) (*shell.Multiplexer, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.shells == nil {
+		return nil, fmt.Errorf("shell multiplexer not initialized")
+	}
+	return runtime.shells, nil
+}
+
+func (t *Tunnel) procsForMessage(msg *protocol.Message) (*proc.Multiplexer, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.procs == nil {
+		return nil, fmt.Errorf("proc multiplexer not initialized")
+	}
+	return runtime.procs, nil
+}
+
+func (t *Tunnel) execsForMessage(msg *protocol.Message) (*docker.ExecMultiplexer, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.execs == nil {
+		return nil, fmt.Errorf("exec multiplexer not initialized")
+	}
+	return runtime.execs, nil
+}
+
+func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
+	t.shells = nil
+	t.execs = nil
+	t.procs = nil
+
+	if t.mode == ModeConnect {
 		t.shells = shell.NewMultiplexer(
 			func(sessionID string, data []byte) {
 				payload, _ := json.Marshal(protocol.ShellOutputPayload{
@@ -124,17 +382,21 @@ func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOption
 					Data:      base64.StdEncoding.EncodeToString(data),
 				})
 				msg := &protocol.Message{Type: protocol.TypeShellOutput, Payload: payload}
-				t.enqueueOutput(sessionID, msg, len(payload))
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceShell, sessionID, protocol.PriorityNormal, msg, len(payload))
 			},
 			func(sessionID string, exitCode int) {
+				t.markOutputSessionCompleteFor(outputSessionNamespaceShell, sessionID)
 				payload, _ := json.Marshal(protocol.ShellExitPayload{SessionID: sessionID, ExitCode: exitCode})
-				t.enqueueControl(&protocol.Message{Type: protocol.TypeShellExit, Payload: payload})
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceShell, sessionID, protocol.PriorityNormal, &protocol.Message{Type: protocol.TypeShellExit, Payload: payload}, len(payload))
 			},
 		)
+		return
 	}
 
-	if mode == ModeNode && nodeOpts != nil {
-		t.docker = docker.NewClient(nodeOpts.DataPath)
+	if t.mode == ModeNode && t.node != nil {
+		if t.docker == nil {
+			t.docker = docker.NewClient(t.node.DataPath)
+		}
 		t.execs = docker.NewExecMultiplexer(
 			func(sessionID string, data []byte) {
 				payload, _ := json.Marshal(protocol.ShellOutputPayload{
@@ -142,17 +404,33 @@ func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOption
 					Data:      base64.StdEncoding.EncodeToString(data),
 				})
 				msg := &protocol.Message{Type: protocol.TypeContainerExecOutput, Payload: payload}
-				t.enqueueOutput(sessionID, msg, len(payload))
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceContainerExec, sessionID, protocol.PriorityNormal, msg, len(payload))
 			},
 			func(sessionID string, exitCode int) {
+				t.markOutputSessionCompleteFor(outputSessionNamespaceContainerExec, sessionID)
 				payload, _ := json.Marshal(protocol.ShellExitPayload{SessionID: sessionID, ExitCode: exitCode})
-				t.enqueueControl(&protocol.Message{Type: protocol.TypeContainerExecExit, Payload: payload})
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceContainerExec, sessionID, protocol.PriorityNormal, &protocol.Message{Type: protocol.TypeContainerExecExit, Payload: payload}, len(payload))
+			},
+		)
+		t.procs = proc.NewMultiplexer(
+			func(sessionID, stream string, data []byte, priority string) {
+				payload, _ := json.Marshal(protocol.ProcOutputPayload{
+					SessionID: sessionID,
+					Stream:    stream,
+					Data:      base64.StdEncoding.EncodeToString(data),
+				})
+				msg := &protocol.Message{Type: protocol.TypeProcOutput, Payload: payload, Priority: priority}
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceProc, sessionID, priority, msg, len(payload))
+			},
+			func(sessionID string, exitCode int, priority string) {
+				t.markOutputSessionCompleteFor(outputSessionNamespaceProc, sessionID)
+				payload, _ := json.Marshal(protocol.ProcExitPayload{SessionID: sessionID, ExitCode: exitCode})
+				// Route proc.exit through the per-session output queue so the final
+				// exit notification cannot overtake already-buffered proc.output.
+				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceProc, sessionID, priority, &protocol.Message{Type: protocol.TypeProcExit, Payload: payload, Priority: priority}, len(payload))
 			},
 		)
 	}
-
-	t.registerHandlers(mode)
-	return t
 }
 
 // registerHandlers sets up message handlers for all supported message types.
@@ -169,6 +447,14 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 	}
 
 	if mode == ModeNode {
+		h.Register(protocol.TypeProcRun, t.handleProcRun)
+		h.Register(protocol.TypeProcCancel, t.handleProcCancel)
+		h.Register(protocol.TypeProcSpawn, t.handleProcSpawn)
+		h.Register(protocol.TypeProcStdin, t.handleProcStdin)
+		h.Register(protocol.TypeProcResize, t.handleProcResize)
+		h.Register(protocol.TypeProcSignal, t.handleProcSignal)
+		h.Register(protocol.TypeProcKill, t.handleProcKill)
+		h.Register(protocol.TypeProcCheckAlive, t.handleProcCheckAlive)
 		h.Register(protocol.TypeContainerEnsure, t.handleContainerEnsure)
 		h.Register(protocol.TypeContainerExec, t.handleContainerExec)
 		h.Register(protocol.TypeContainerExecStdin, t.handleContainerExecStdin)
@@ -193,7 +479,7 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 	h.Register(protocol.TypeFileMkdir, t.handleFileMkdir)
 	h.Register(protocol.TypeFileRemove, t.handleFileRemove)
 
-	h.Register(protocol.TypePing, func(id string, _ json.RawMessage) (string, any, error) {
+	h.Register(protocol.TypePing, func(_ *protocol.Message) (string, any, error) {
 		return protocol.TypePong, map[string]string{"status": "ok"}, nil
 	})
 }
@@ -240,6 +526,7 @@ func (t *Tunnel) Run() error {
 			t.conn = nil
 		}
 		t.connMu.Unlock()
+		t.resetRuntimeState()
 
 		log.Printf("[tunnel] will reconnect...")
 		select {
@@ -253,17 +540,7 @@ func (t *Tunnel) Run() error {
 // Stop gracefully shuts down the tunnel.
 func (t *Tunnel) Stop() {
 	t.cancel()
-	t.outputMu.Lock()
-	for _, q := range t.outputQueues {
-		q.full.Broadcast()
-	}
-	t.outputMu.Unlock()
-	if t.shells != nil {
-		t.shells.KillAll()
-	}
-	if t.execs != nil {
-		t.execs.KillAll()
-	}
+	t.resetRuntimeState()
 	t.connMu.Lock()
 	if t.conn != nil {
 		_ = t.conn.WriteMessage(websocket.CloseMessage,
@@ -271,6 +548,82 @@ func (t *Tunnel) Stop() {
 		t.conn.Close()
 	}
 	t.connMu.Unlock()
+}
+
+func (t *Tunnel) resetRuntimeState() {
+	// Swap to a fresh runtime generation before cancelling the previous runtime.
+	// That way any stale request/control goroutine that wakes up on cancellation
+	// sees the new generation and exits instead of leaking into the new runtime.
+	nextCtx, nextCancel := context.WithCancel(t.ctx)
+
+	t.runtimeMu.Lock()
+	prevCancel := t.runtimeCancel
+	oldShells := t.shells
+	oldExecs := t.execs
+	oldProcs := t.procs
+	// Retire the old muxes at the reset boundary before we cancel and tear the
+	// runtime down. Stale handlers can keep these pointers, so they must reject
+	// new Create/Spawn calls immediately instead of waiting for KillAll().
+	if oldShells != nil {
+		oldShells.Close()
+	}
+	if oldExecs != nil {
+		oldExecs.Close()
+	}
+	if oldProcs != nil {
+		oldProcs.Close()
+	}
+	generation := t.runtimeGeneration.Add(1)
+	t.runtimeCtx = nextCtx
+	t.runtimeCancel = nextCancel
+	t.rebuildRuntimeMultiplexers(generation)
+	t.runtimeMu.Unlock()
+
+	if prevCancel != nil {
+		prevCancel()
+	}
+
+	t.outputMu.Lock()
+	for _, q := range t.outputQueues {
+		q.closed = true
+		q.full.Broadcast()
+	}
+	t.outputQueues = make(map[string]*sessionOutputQueue)
+	t.completedOutputSessions = make(map[string]struct{})
+	t.activePriorityOutputs = nil
+	t.activeNormalOutputs = nil
+	t.priorityRRIndex = 0
+	t.normalRRIndex = 0
+	t.outputMu.Unlock()
+	if oldShells != nil {
+		oldShells.KillAll()
+	}
+	if oldExecs != nil {
+		oldExecs.KillAll()
+	}
+	if oldProcs != nil {
+		oldProcs.KillAll()
+	}
+	t.drainControlQueues()
+}
+
+func (t *Tunnel) drainControlQueues() {
+	for {
+		select {
+		case <-t.priorityControlQ:
+		default:
+			goto drainNormal
+		}
+	}
+
+drainNormal:
+	for {
+		select {
+		case <-t.normalControlQ:
+		default:
+			return
+		}
+	}
 }
 
 // connect establishes the WebSocket connection and performs authentication.
@@ -428,7 +781,10 @@ func (t *Tunnel) heartbeatInfo() *protocol.HeartbeatPayload {
 	if t.mode == ModeNode {
 		sessions := 0
 		if t.execs != nil {
-			sessions = t.execs.Count()
+			sessions += t.execs.Count()
+		}
+		if t.procs != nil {
+			sessions += t.procs.Count()
 		}
 		containerCount := 0
 		dataPath := "/"
@@ -449,35 +805,69 @@ func (t *Tunnel) heartbeatInfo() *protocol.HeartbeatPayload {
 
 // messageLoop runs the main read/write loop.
 func (t *Tunnel) messageLoop() error {
+	generation := t.currentRuntimeGeneration()
+	t.connMu.Lock()
+	conn := t.conn
+	t.connMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
 	// Start heartbeat
 	heartbeatStop := make(chan struct{})
-	go health.HeartbeatLoop(30*time.Second, t.heartbeatInfo, t.controlQ, heartbeatStop)
-	defer close(heartbeatStop)
+	go health.HeartbeatLoop(30*time.Second, t.heartbeatInfo, func(msg *protocol.Message) {
+		t.enqueueControlForGeneration(generation, msg)
+	}, heartbeatStop)
+	writerDone := make(chan struct{})
+	defer func() {
+		close(heartbeatStop)
+		// Close the generation-bound socket and wait for the matching writer to exit
+		// before Run() continues to the next reconnect attempt. That keeps an older
+		// writer from surviving long enough to drain fresh queue entries.
+		_ = conn.Close()
+		<-writerDone
+	}()
 
-	// Start writer goroutine
+	// Start writer goroutine.
 	go func() {
-		for {
-			if err := t.drainControlQueue(); err != nil {
+		defer close(writerDone)
+		consecutivePriority := 0
+		send := func(msg *protocol.Message) bool {
+			if err := t.writeMessageOnConn(conn, msg); err != nil {
 				log.Printf("[tunnel] write error: %v", err)
-				return
+				return false
 			}
-
-			if msg, ok := t.dequeueOutput(); ok {
-				if err := t.writeMessage(msg); err != nil {
-					log.Printf("[tunnel] write error: %v", err)
+			if protocol.NormalizePriority(msg.Priority) == protocol.PriorityPriority {
+				consecutivePriority++
+			} else {
+				consecutivePriority = 0
+			}
+			return true
+		}
+		for {
+			if msg, ok := t.tryDequeueNextMessage(consecutivePriority); ok {
+				if !send(msg) {
 					return
 				}
 				continue
 			}
 
 			select {
-			case msg := <-t.controlQ:
-				if err := t.writeMessage(msg); err != nil {
-					log.Printf("[tunnel] write error: %v", err)
+			case msg := <-t.priorityControlQ:
+				if t.shouldDropQueuedControlMessage(msg) {
+					continue
+				}
+				if !send(msg) {
 					return
 				}
 			case <-t.outputReady:
 				continue
+			case msg := <-t.normalControlQ:
+				if t.shouldDropQueuedControlMessage(msg) {
+					continue
+				}
+				if !send(msg) {
+					return
+				}
 			case <-t.ctx.Done():
 				return
 			case <-heartbeatStop:
@@ -494,7 +884,7 @@ func (t *Tunnel) messageLoop() error {
 		default:
 		}
 
-		_, data, err := t.conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
@@ -504,35 +894,106 @@ func (t *Tunnel) messageLoop() error {
 			log.Printf("[tunnel] invalid message: %v", err)
 			continue
 		}
+		msg.Priority = protocol.NormalizePriority(msg.Priority)
 
 		if msg.Type == protocol.TypePong {
 			continue
 		}
 
-		// Handle async to not block the reader
-		go func(m protocol.Message) {
+		// Handle async to not block the reader.
+		go func(m protocol.Message, generation uint64) {
+			m.Generation = generation
+			if generation != 0 && generation != t.currentRuntimeGeneration() {
+				return
+			}
 			resp := t.handler.Handle(&m)
 			if resp != nil {
-				t.enqueueControl(resp)
+				t.enqueueControlForGeneration(generation, resp)
 			}
-		}(msg)
+		}(msg, generation)
 	}
+}
+
+func (t *Tunnel) enqueueControlForGeneration(generation uint64, msg *protocol.Message) {
+	if msg == nil {
+		return
+	}
+	runtime, err := t.runtimeSnapshotForGeneration(generation)
+	if err != nil {
+		return
+	}
+	msg.Priority = protocol.NormalizePriority(msg.Priority)
+	msg.Generation = generation
+	target := t.normalControlQ
+	if msg.Priority == protocol.PriorityPriority {
+		target = t.priorityControlQ
+	}
+	for {
+		select {
+		case target <- msg:
+			return
+		case <-runtime.ctx.Done():
+			if generation != 0 && generation != t.currentRuntimeGeneration() {
+				return
+			}
+			// Generation-zero callers are intentionally unbound; let them retry using
+			// the same queue behavior as a normal enqueue.
+		case <-t.ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *Tunnel) shouldDropQueuedControlMessage(msg *protocol.Message) bool {
+	if msg == nil {
+		return true
+	}
+	// Control queues outlive a single websocket generation, so a blocked
+	// old-generation sender can still win the reset race and enqueue after we
+	// swapped runtimes. Drop those stale entries before a writer can forward them
+	// onto the next connection.
+	if msg.Generation != 0 && msg.Generation != t.currentRuntimeGeneration() {
+		return true
+	}
+	return false
 }
 
 func (t *Tunnel) enqueueControl(msg *protocol.Message) {
 	if msg == nil {
 		return
 	}
+	msg.Priority = protocol.NormalizePriority(msg.Priority)
+	target := t.normalControlQ
+	if msg.Priority == protocol.PriorityPriority {
+		target = t.priorityControlQ
+	}
 	select {
-	case t.controlQ <- msg:
+	case target <- msg:
 	case <-t.ctx.Done():
 	}
 }
 
-func (t *Tunnel) enqueueOutput(sessionID string, msg *protocol.Message, size int) {
+func (t *Tunnel) enqueueOutput(sessionID, priority string, msg *protocol.Message, size int) {
+	t.enqueueOutputForGeneration(t.currentRuntimeGeneration(), sessionID, priority, msg, size)
+}
+
+func (t *Tunnel) enqueueOutputForSession(namespace outputSessionNamespace, sessionID, priority string, msg *protocol.Message, size int) {
+	t.enqueueOutputForSessionForGeneration(t.currentRuntimeGeneration(), namespace, sessionID, priority, msg, size)
+}
+
+func (t *Tunnel) enqueueOutputForSessionForGeneration(generation uint64, namespace outputSessionNamespace, sessionID, priority string, msg *protocol.Message, size int) {
+	t.enqueueOutputForGeneration(generation, outputSessionQueueKey(namespace, sessionID), priority, msg, size)
+}
+
+func (t *Tunnel) enqueueOutputForGeneration(generation uint64, sessionID, priority string, msg *protocol.Message, size int) {
 	if msg == nil {
 		return
 	}
+	if generation != 0 && generation != t.currentRuntimeGeneration() {
+		return
+	}
+	priority = protocol.NormalizePriority(priority)
+	msg.Priority = priority
 	if size <= 0 {
 		size = len(msg.Payload)
 	}
@@ -540,26 +1001,52 @@ func (t *Tunnel) enqueueOutput(sessionID string, msg *protocol.Message, size int
 	t.outputMu.Lock()
 	q := t.outputQueues[sessionID]
 	if q == nil {
-		q = &sessionOutputQueue{}
+		q = &sessionOutputQueue{priority: priority}
 		q.full = sync.NewCond(&t.outputMu)
 		t.outputQueues[sessionID] = q
+	} else {
+		q.priority = priority
+	}
+	if _, completed := t.completedOutputSessions[sessionID]; completed {
+		q.drainWhenEmpty = true
+	}
+	q.writers++
+	finishWrite := func() {
+		q.writers--
+		t.maybeDeleteOutputQueueLocked(sessionID, q)
+		t.outputMu.Unlock()
 	}
 
-	for t.sessionQueueWouldBlock(q, size) {
+	for {
+		if q.closed || (generation != 0 && generation != t.currentRuntimeGeneration()) {
+			finishWrite()
+			return
+		}
+		if !t.sessionQueueWouldBlock(q, size) {
+			break
+		}
 		if t.ctx.Err() != nil {
-			t.outputMu.Unlock()
+			finishWrite()
 			return
 		}
 		q.full.Wait()
+	}
+	if q.closed || (generation != 0 && generation != t.currentRuntimeGeneration()) {
+		finishWrite()
+		return
 	}
 
 	q.items = append(q.items, queuedOutput{msg: msg, size: size})
 	q.bytes += size
 	if !q.active {
 		q.active = true
-		t.activeOutputs = append(t.activeOutputs, sessionID)
+		if q.priority == protocol.PriorityPriority {
+			t.activePriorityOutputs = append(t.activePriorityOutputs, sessionID)
+		} else {
+			t.activeNormalOutputs = append(t.activeNormalOutputs, sessionID)
+		}
 	}
-	t.outputMu.Unlock()
+	finishWrite()
 
 	select {
 	case t.outputReady <- struct{}{}:
@@ -577,16 +1064,66 @@ func (t *Tunnel) sessionQueueWouldBlock(q *sessionOutputQueue, incomingSize int)
 	return q.bytes+incomingSize > sessionQueueMaxBytes
 }
 
-func (t *Tunnel) dequeueOutput() (*protocol.Message, bool) {
+func (t *Tunnel) tryDequeueControl(priority string) (*protocol.Message, bool) {
+	source := t.normalControlQ
+	if protocol.NormalizePriority(priority) == protocol.PriorityPriority {
+		source = t.priorityControlQ
+	}
+	for {
+		select {
+		case msg := <-source:
+			if t.shouldDropQueuedControlMessage(msg) {
+				continue
+			}
+			return msg, true
+		default:
+			return nil, false
+		}
+	}
+}
+
+func (t *Tunnel) tryDequeueNormalMessage() (*protocol.Message, bool) {
+	if msg, ok := t.tryDequeueControl(protocol.PriorityNormal); ok {
+		return msg, true
+	}
+	return t.dequeueOutputForPriority(protocol.PriorityNormal)
+}
+
+func (t *Tunnel) tryDequeueNextMessage(consecutivePriority int) (*protocol.Message, bool) {
+	if consecutivePriority >= priorityBurstLimit {
+		if msg, ok := t.tryDequeueNormalMessage(); ok {
+			return msg, true
+		}
+	}
+	if msg, ok := t.tryDequeueControl(protocol.PriorityPriority); ok {
+		return msg, true
+	}
+	if msg, ok := t.dequeueOutputForPriority(protocol.PriorityPriority); ok {
+		return msg, true
+	}
+	return t.tryDequeueNormalMessage()
+}
+
+func (t *Tunnel) dequeueOutputForPriority(priority string) (*protocol.Message, bool) {
 	t.outputMu.Lock()
 	defer t.outputMu.Unlock()
+	return t.dequeueOutputForPriorityLocked(protocol.NormalizePriority(priority))
+}
 
-	for len(t.activeOutputs) > 0 {
-		idx := t.rrIndex % len(t.activeOutputs)
-		sessionID := t.activeOutputs[idx]
+func (t *Tunnel) dequeueOutputForPriorityLocked(priority string) (*protocol.Message, bool) {
+	activeOutputs := &t.activeNormalOutputs
+	rrIndex := &t.normalRRIndex
+	if priority == protocol.PriorityPriority {
+		activeOutputs = &t.activePriorityOutputs
+		rrIndex = &t.priorityRRIndex
+	}
+
+	for len(*activeOutputs) > 0 {
+		idx := *rrIndex % len(*activeOutputs)
+		sessionID := (*activeOutputs)[idx]
 		q := t.outputQueues[sessionID]
 		if q == nil || len(q.items) == 0 {
-			t.removeActiveOutputAt(idx)
+			t.removeActiveOutputAtLocked(activeOutputs, rrIndex, idx)
 			continue
 		}
 
@@ -599,55 +1136,50 @@ func (t *Tunnel) dequeueOutput() (*protocol.Message, bool) {
 		q.full.Signal()
 
 		if len(q.items) == 0 {
-			t.removeActiveOutputAt(idx)
+			t.removeActiveOutputAtLocked(activeOutputs, rrIndex, idx)
 		} else {
-			t.rrIndex = (idx + 1) % len(t.activeOutputs)
+			*rrIndex = (idx + 1) % len(*activeOutputs)
 		}
 		return item.msg, true
 	}
 
-	t.rrIndex = 0
+	*rrIndex = 0
 	return nil, false
 }
 
-func (t *Tunnel) removeActiveOutputAt(idx int) {
-	if idx < 0 || idx >= len(t.activeOutputs) {
+func (t *Tunnel) removeActiveOutputAtLocked(activeOutputs *[]string, rrIndex *int, idx int) {
+	if idx < 0 || idx >= len(*activeOutputs) {
 		return
 	}
-	sessionID := t.activeOutputs[idx]
+	sessionID := (*activeOutputs)[idx]
 	q := t.outputQueues[sessionID]
 	if q != nil {
 		q.active = false
+		t.maybeDeleteOutputQueueLocked(sessionID, q)
 	}
 
-	t.activeOutputs = append(t.activeOutputs[:idx], t.activeOutputs[idx+1:]...)
-	if len(t.activeOutputs) == 0 {
-		t.rrIndex = 0
+	*activeOutputs = append((*activeOutputs)[:idx], (*activeOutputs)[idx+1:]...)
+	if len(*activeOutputs) == 0 {
+		*rrIndex = 0
 		return
 	}
-	if idx < t.rrIndex {
-		t.rrIndex--
+	if idx < *rrIndex {
+		*rrIndex--
 	}
-	if t.rrIndex >= len(t.activeOutputs) {
-		t.rrIndex = 0
-	}
-}
-
-func (t *Tunnel) drainControlQueue() error {
-	for {
-		select {
-		case msg := <-t.controlQ:
-			if err := t.writeMessage(msg); err != nil {
-				return err
-			}
-		default:
-			return nil
-		}
+	if *rrIndex >= len(*activeOutputs) {
+		*rrIndex = 0
 	}
 }
 
 // writeMessage sends a message over the WebSocket.
 func (t *Tunnel) writeMessage(msg *protocol.Message) error {
+	t.connMu.Lock()
+	conn := t.conn
+	t.connMu.Unlock()
+	return t.writeMessageOnConn(conn, msg)
+}
+
+func (t *Tunnel) writeMessageOnConn(conn *websocket.Conn, msg *protocol.Message) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -655,10 +1187,13 @@ func (t *Tunnel) writeMessage(msg *protocol.Message) error {
 
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
-	if t.conn == nil {
+	if conn == nil || t.conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	return t.conn.WriteMessage(websocket.TextMessage, data)
+	if conn != t.conn {
+		return fmt.Errorf("stale connection")
+	}
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (t *Tunnel) wsURL() string {
@@ -675,13 +1210,20 @@ func (t *Tunnel) wsURL() string {
 
 // --- Shell message handlers ---
 
-func (t *Tunnel) handleShellCreate(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellCreate(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellCreate + ".result", nil, err
+	}
 	var p protocol.ShellCreatePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellCreate + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	_, err := t.shells.Create(p.SessionID, p.Shell, p.Args, p.CWD, p.Env)
+	if t.outputSessionStateExists(outputSessionNamespaceShell, p.SessionID) {
+		return protocol.TypeShellCreate + ".result", nil, fmt.Errorf("shell session %s still has queued output from the previous run", p.SessionID)
+	}
+	_, err = shells.Create(p.SessionID, p.Shell, p.Args, p.CWD, p.Env)
 	if err != nil {
 		return protocol.TypeShellCreate + ".result", nil, err
 	}
@@ -689,13 +1231,17 @@ func (t *Tunnel) handleShellCreate(id string, payload json.RawMessage) (string, 
 	return protocol.TypeShellCreate + ".result", map[string]string{"session_id": p.SessionID, "status": "created"}, nil
 }
 
-func (t *Tunnel) handleShellExec(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellExec(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellExecResult, nil, err
+	}
 	var p protocol.ShellExecPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellExecResult, nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	sess, err := t.shells.Get(p.SessionID)
+	sess, err := shells.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeShellExecResult, nil, err
 	}
@@ -713,26 +1259,34 @@ func (t *Tunnel) handleShellExec(id string, payload json.RawMessage) (string, an
 	}, nil
 }
 
-func (t *Tunnel) handleShellKill(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellKill(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellKill + ".result", nil, err
+	}
 	var p protocol.ShellKillPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellKill + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	if err := t.shells.Kill(p.SessionID); err != nil {
+	if err := shells.Kill(p.SessionID); err != nil {
 		return protocol.TypeShellKill + ".result", nil, err
 	}
 
 	return protocol.TypeShellKill + ".result", map[string]string{"status": "killed"}, nil
 }
 
-func (t *Tunnel) handleShellWriteStdin(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellWriteStdin(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellWriteStdin + ".result", nil, err
+	}
 	var p protocol.ShellWriteStdinPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellWriteStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	sess, err := t.shells.Get(p.SessionID)
+	sess, err := shells.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeShellWriteStdin + ".result", nil, err
 	}
@@ -744,13 +1298,17 @@ func (t *Tunnel) handleShellWriteStdin(id string, payload json.RawMessage) (stri
 	return protocol.TypeShellWriteStdin + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleShellResize(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellResize(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellResize + ".result", nil, err
+	}
 	var p protocol.ShellResizePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellResize + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	sess, err := t.shells.Get(p.SessionID)
+	sess, err := shells.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeShellResize + ".result", nil, err
 	}
@@ -762,13 +1320,17 @@ func (t *Tunnel) handleShellResize(id string, payload json.RawMessage) (string, 
 	return protocol.TypeShellResize + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleShellSignal(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleShellSignal(msg *protocol.Message) (string, any, error) {
+	shells, err := t.shellsForMessage(msg)
+	if err != nil {
+		return protocol.TypeShellSignal + ".result", nil, err
+	}
 	var p protocol.ShellSignalPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeShellSignal + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 
-	sess, err := t.shells.Get(p.SessionID)
+	sess, err := shells.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeShellSignal + ".result", nil, err
 	}
@@ -780,14 +1342,203 @@ func (t *Tunnel) handleShellSignal(id string, payload json.RawMessage) (string, 
 	return protocol.TypeShellSignal + ".result", map[string]string{"status": "ok"}, nil
 }
 
+// --- Proc message handlers ---
+
+func (t *Tunnel) handleProcRun(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcRunResult, nil, err
+	}
+	if runtime.procs == nil {
+		return protocol.TypeProcRunResult, nil, fmt.Errorf("proc multiplexer not initialized")
+	}
+	var p protocol.ProcRunPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcRunResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	var stdin []byte
+	if p.Stdin != "" {
+		var err error
+		stdin, err = base64.StdEncoding.DecodeString(p.Stdin)
+		if err != nil {
+			return protocol.TypeProcRunResult, nil, fmt.Errorf("decode stdin: %w", err)
+		}
+	}
+	runCtx := runtime.ctx
+	requestGeneration := t.requestGeneration(msg)
+	cancelKey := ""
+	if msg != nil {
+		cancelKey = procRunCancelID(p.RunID, msg.ID)
+	}
+	if cancelKey != "" {
+		var cancel context.CancelCauseFunc
+		runCtx, cancel = context.WithCancelCause(runtime.ctx)
+		if err := t.rememberProcRunCancel(cancelKey, requestGeneration, cancel); err != nil {
+			cancel(nil)
+			return protocol.TypeProcRunResult, nil, err
+		}
+		defer func() {
+			t.forgetProcRunCancel(cancelKey, requestGeneration)
+			cancel(nil)
+		}()
+	}
+	result, err := proc.Run(runCtx, p.Argv, p.CWD, p.Env, stdin, p.TimeoutMs)
+	payload := procRunResultPayload(result, false)
+	if err != nil {
+		if payload != nil && errors.Is(err, context.Canceled) && errors.Is(context.Cause(runCtx), procRunCanceledCause) {
+			payload.Canceled = true
+			return protocol.TypeProcRunResult, payload, nil
+		}
+		return protocol.TypeProcRunResult, nil, err
+	}
+	return protocol.TypeProcRunResult, payload, nil
+}
+
+func (t *Tunnel) handleProcCancel(msg *protocol.Message) (string, any, error) {
+	var p protocol.ProcCancelPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcCancelResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	generation := t.requestGeneration(msg)
+	status := "not_found"
+	matchedField := ""
+	matchedID := ""
+	if p.RunID != "" && t.cancelProcRun(p.RunID, generation) {
+		status = "canceled"
+		matchedField = "run_id"
+		matchedID = p.RunID
+	} else if p.RequestID != "" && t.cancelProcRun(p.RequestID, generation) {
+		status = "canceled"
+		matchedField = "request_id"
+		matchedID = p.RequestID
+	}
+	result := map[string]string{"status": status}
+	if matchedField != "" {
+		result[matchedField] = matchedID
+	}
+	return protocol.TypeProcCancelResult, result, nil
+}
+
+func (t *Tunnel) handleProcSpawn(msg *protocol.Message) (string, any, error) {
+	procs, err := t.procsForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcSpawnResult, nil, err
+	}
+	var p protocol.ProcSpawnPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcSpawnResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	if t.outputSessionStateExists(outputSessionNamespaceProc, p.SessionID) {
+		return protocol.TypeProcSpawnResult, nil, fmt.Errorf("proc session %s still has queued output from the previous run", p.SessionID)
+	}
+	priority := protocol.NormalizePriority(msg.Priority)
+	log.Printf("[relay-node] rpc proc.spawn session=%s argv=%v pty=%t priority=%s", p.SessionID, p.Argv, p.Pty, priority)
+	if err := procs.Spawn(p.SessionID, p.Argv, p.CWD, p.Env, p.Pty, p.Cols, p.Rows, priority); err != nil {
+		return protocol.TypeProcSpawnResult, nil, err
+	}
+	return protocol.TypeProcSpawnResult, map[string]string{"status": "started", "session_id": p.SessionID}, nil
+}
+
+func (t *Tunnel) handleProcStdin(msg *protocol.Message) (string, any, error) {
+	procs, err := t.procsForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcStdinResult, nil, err
+	}
+	var p protocol.ProcStdinPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcStdinResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc proc.stdin session=%s", p.SessionID)
+	sess, err := procs.Get(p.SessionID)
+	if err != nil {
+		return protocol.TypeProcStdinResult, nil, err
+	}
+	if err := sess.WriteStdinBase64(p.Data); err != nil {
+		return protocol.TypeProcStdinResult, nil, err
+	}
+	return protocol.TypeProcStdinResult, map[string]string{"status": "ok"}, nil
+}
+
+func (t *Tunnel) handleProcResize(msg *protocol.Message) (string, any, error) {
+	procs, err := t.procsForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcResizeResult, nil, err
+	}
+	var p protocol.ProcResizePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcResizeResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc proc.resize session=%s cols=%d rows=%d", p.SessionID, p.Cols, p.Rows)
+	if err := procs.Resize(p.SessionID, p.Cols, p.Rows); err != nil {
+		return protocol.TypeProcResizeResult, nil, err
+	}
+	return protocol.TypeProcResizeResult, map[string]string{"status": "ok"}, nil
+}
+
+func (t *Tunnel) handleProcSignal(msg *protocol.Message) (string, any, error) {
+	procs, err := t.procsForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcSignalResult, nil, err
+	}
+	var p protocol.ProcSignalPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcSignalResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc proc.signal session=%s signal=%s", p.SessionID, p.Signal)
+	if err := procs.Signal(p.SessionID, p.Signal); err != nil {
+		return protocol.TypeProcSignalResult, nil, err
+	}
+	return protocol.TypeProcSignalResult, map[string]string{"status": "ok"}, nil
+}
+
+func (t *Tunnel) handleProcKill(msg *protocol.Message) (string, any, error) {
+	procs, err := t.procsForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcKillResult, nil, err
+	}
+	var p protocol.ProcKillPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcKillResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	log.Printf("[relay-node] rpc proc.kill session=%s", p.SessionID)
+	if err := procs.Kill(p.SessionID); err != nil {
+		return protocol.TypeProcKillResult, nil, err
+	}
+	return protocol.TypeProcKillResult, map[string]string{"status": "ok"}, nil
+}
+
+func (t *Tunnel) handleProcCheckAlive(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeProcCheckAliveResult, nil, err
+	}
+	var p protocol.ProcKillPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeProcCheckAliveResult, nil, fmt.Errorf("parse payload: %w", err)
+	}
+	alive := false
+	if runtime.procs != nil {
+		alive = runtime.procs.CheckAlive(p.SessionID)
+	}
+	log.Printf("[relay-node] rpc proc.check_alive session=%s alive=%t", p.SessionID, alive)
+	return protocol.TypeProcCheckAliveResult, map[string]bool{"alive": alive}, nil
+}
+
 // --- Container message handlers ---
 
-func (t *Tunnel) handleContainerEnsure(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerEnsure(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerEnsure + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	if t.docker == nil {
 		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("docker client not initialized")
 	}
 	var p protocol.ContainerEnsurePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	image := p.Image
@@ -795,18 +1546,30 @@ func (t *Tunnel) handleContainerEnsure(id string, payload json.RawMessage) (stri
 		image = p.DockerImage
 	}
 	log.Printf("[relay-node] rpc container.ensure container=%s image=%s user=%s agent=%s", p.ContainerID, image, p.UserID, p.AgentID)
-	err := t.docker.EnsureContainer(docker.EnsureOptions{
-		ContainerID: p.ContainerID,
-		Image:       image,
-		UserID:      p.UserID,
-		AgentID:     p.AgentID,
-		RootAgentID: p.RootAgentID,
-		ResourceLimits: docker.ResourceLimits{
-			CPUs:      p.ResourceLimits.CPUs,
-			MemoryMB:  p.ResourceLimits.MemoryMB,
-			PidsLimit: p.ResourceLimits.PidsLimit,
-		},
-		Mounts: mapMounts(p.Mounts),
+	err = runtime.execs.WithContainerMutation(p.ContainerID, func() error {
+		status, err := t.docker.ContainerStatusContext(runtime.ctx, p.ContainerID)
+		if err != nil {
+			return err
+		}
+		if status == docker.StatusRunning {
+			return nil
+		}
+		if err := t.terminateContainerExecSessions(runtime.execs, p.ContainerID, protocol.TypeContainerEnsure); err != nil {
+			return fmt.Errorf("terminate container exec sessions: %w", err)
+		}
+		return t.docker.EnsureContainerContext(runtime.ctx, docker.EnsureOptions{
+			ContainerID: p.ContainerID,
+			Image:       image,
+			UserID:      p.UserID,
+			AgentID:     p.AgentID,
+			RootAgentID: p.RootAgentID,
+			ResourceLimits: docker.ResourceLimits{
+				CPUs:      p.ResourceLimits.CPUs,
+				MemoryMB:  p.ResourceLimits.MemoryMB,
+				PidsLimit: p.ResourceLimits.PidsLimit,
+			},
+			Mounts: mapMounts(p.Mounts),
+		})
 	})
 	if err != nil {
 		return protocol.TypeContainerEnsure + ".result", nil, err
@@ -822,28 +1585,36 @@ func mapMounts(in []protocol.DockerMount) []docker.Mount {
 	return out
 }
 
-func (t *Tunnel) handleContainerExec(id string, payload json.RawMessage) (string, any, error) {
-	if t.execs == nil {
-		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+func (t *Tunnel) handleContainerExec(msg *protocol.Message) (string, any, error) {
+	execs, err := t.execsForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExec + ".result", nil, err
 	}
 	var p protocol.ContainerExecPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
+	if t.outputSessionStateExists(outputSessionNamespaceContainerExec, p.SessionID) {
+		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("container exec session %s still has queued output from the previous run", p.SessionID)
+	}
 	log.Printf("[relay-node] rpc container.exec container=%s session=%s command=%s", p.ContainerID, p.SessionID, p.Command)
-	if err := t.execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env, p.Tty, p.Cols, p.Rows); err != nil {
+	if err := execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env, p.Tty, p.Cols, p.Rows); err != nil {
 		return protocol.TypeContainerExec + ".result", nil, err
 	}
 	return protocol.TypeContainerExec + ".result", map[string]string{"status": "started", "session_id": p.SessionID}, nil
 }
 
-func (t *Tunnel) handleContainerExecStdin(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecStdin(msg *protocol.Message) (string, any, error) {
+	execs, err := t.execsForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecStdin + ".result", nil, err
+	}
 	var p protocol.ContainerExecStdinPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec.stdin session=%s", p.SessionID)
-	sess, err := t.execs.Get(p.SessionID)
+	sess, err := execs.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeContainerExecStdin + ".result", nil, err
 	}
@@ -853,25 +1624,33 @@ func (t *Tunnel) handleContainerExecStdin(id string, payload json.RawMessage) (s
 	return protocol.TypeContainerExecStdin + ".result", nil, nil
 }
 
-func (t *Tunnel) handleContainerExecResize(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecResize(msg *protocol.Message) (string, any, error) {
+	execs, err := t.execsForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecResize + ".result", nil, err
+	}
 	var p protocol.ContainerExecResizePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecResize + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec.resize session=%s cols=%d rows=%d", p.SessionID, p.Cols, p.Rows)
-	if err := t.execs.Resize(p.SessionID, p.Cols, p.Rows); err != nil {
+	if err := execs.Resize(p.SessionID, p.Cols, p.Rows); err != nil {
 		return protocol.TypeContainerExecResize + ".result", nil, err
 	}
 	return protocol.TypeContainerExecResize + ".result", nil, nil
 }
 
-func (t *Tunnel) handleContainerExecSignal(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecSignal(msg *protocol.Message) (string, any, error) {
+	execs, err := t.execsForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecSignal + ".result", nil, err
+	}
 	var p protocol.ContainerExecSignalPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecSignal + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec.signal session=%s signal=%s shell_pid=%d", p.SessionID, p.Signal, p.ShellPID)
-	sess, err := t.execs.Get(p.SessionID)
+	sess, err := execs.Get(p.SessionID)
 	if err != nil {
 		return protocol.TypeContainerExecSignal + ".result", nil, err
 	}
@@ -881,33 +1660,41 @@ func (t *Tunnel) handleContainerExecSignal(id string, payload json.RawMessage) (
 	return protocol.TypeContainerExecSignal + ".result", nil, nil
 }
 
-func (t *Tunnel) handleContainerExecKill(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecKill(msg *protocol.Message) (string, any, error) {
+	execs, err := t.execsForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecKill + ".result", nil, err
+	}
 	var p protocol.ContainerExecKillPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecKill + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec.kill session=%s", p.SessionID)
-	if err := t.execs.Kill(p.SessionID); err != nil {
+	if err := execs.Kill(p.SessionID); err != nil {
 		return protocol.TypeContainerExecKill + ".result", nil, err
 	}
 	return protocol.TypeContainerExecKill + ".result", nil, nil
 }
 
-func (t *Tunnel) handleContainerExecCheckAlive(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecCheckAlive(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecCheckAlive + ".result", nil, err
+	}
 	var p protocol.ContainerExecKillPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecCheckAlive + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
-	alive := t.execs.CheckAlive(p.SessionID)
+	alive := runtime.execs != nil && runtime.execs.CheckAlive(p.SessionID)
 	log.Printf("[relay-node] rpc container.exec.check_alive session=%s alive=%t", p.SessionID, alive)
 	return protocol.TypeContainerExecCheckAlive + ".result", map[string]bool{"alive": alive}, nil
 }
 
-func (t *Tunnel) terminateContainerExecSessions(containerID, lifecycleOp string) error {
-	if t.execs == nil {
+func (t *Tunnel) terminateContainerExecSessions(execs *docker.ExecMultiplexer, containerID, lifecycleOp string) error {
+	if execs == nil {
 		return nil
 	}
-	killed, err := t.execs.KillByContainer(containerID, containerExecReapTimeoutMs)
+	killed, err := execs.KillByContainer(containerID, containerExecReapTimeoutMs)
 	if err != nil {
 		log.Printf("[relay-node] rpc %s container=%s exec_cleanup_failed killed=%d err=%v", lifecycleOp, containerID, killed, err)
 		return err
@@ -918,79 +1705,116 @@ func (t *Tunnel) terminateContainerExecSessions(containerID, lifecycleOp string)
 	return nil
 }
 
-func (t *Tunnel) withContainerMutation(containerID, lifecycleOp string, action func() error) error {
-	if t.execs == nil {
+func (t *Tunnel) withContainerMutationUsingExecs(execs *docker.ExecMultiplexer, containerID, lifecycleOp string, action func() error) error {
+	if execs == nil {
 		return action()
 	}
-	t.execs.BeginContainerMutation(containerID)
-	defer t.execs.EndContainerMutation(containerID)
-
-	if err := t.terminateContainerExecSessions(containerID, lifecycleOp); err != nil {
-		return fmt.Errorf("terminate container exec sessions: %w", err)
-	}
-	return action()
+	return execs.WithContainerMutation(containerID, func() error {
+		if err := t.terminateContainerExecSessions(execs, containerID, lifecycleOp); err != nil {
+			return fmt.Errorf("terminate container exec sessions: %w", err)
+		}
+		return action()
+	})
 }
 
-func (t *Tunnel) handleContainerPause(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) withContainerMutation(containerID, lifecycleOp string, action func() error) error {
+	return t.withContainerMutationUsingExecs(t.execs, containerID, lifecycleOp, action)
+}
+
+func (t *Tunnel) handleContainerPause(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerPause + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.pause container=%s", p.ContainerID)
-	if err := t.withContainerMutation(p.ContainerID, "container.pause", func() error {
-		return t.docker.Pause(p.ContainerID)
+	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.pause", func() error {
+		return t.docker.PauseContext(runtime.ctx, p.ContainerID)
 	}); err != nil {
 		return protocol.TypeContainerPause + ".result", nil, err
 	}
 	return protocol.TypeContainerPause + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleContainerUnpause(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerUnpause(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerUnpause + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerUnpause + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerUnpause + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.unpause container=%s", p.ContainerID)
-	if err := t.docker.Unpause(p.ContainerID); err != nil {
+	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.unpause", func() error {
+		return t.docker.UnpauseContext(runtime.ctx, p.ContainerID)
+	}); err != nil {
 		return protocol.TypeContainerUnpause + ".result", nil, err
 	}
 	return protocol.TypeContainerUnpause + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleContainerStop(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerStop(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerStop + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.stop container=%s", p.ContainerID)
-	if err := t.withContainerMutation(p.ContainerID, "container.stop", func() error {
-		return t.docker.Stop(p.ContainerID)
+	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.stop", func() error {
+		return t.docker.StopContext(runtime.ctx, p.ContainerID)
 	}); err != nil {
 		return protocol.TypeContainerStop + ".result", nil, err
 	}
 	return protocol.TypeContainerStop + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleContainerDestroy(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerDestroy(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerDestroy + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.destroy container=%s", p.ContainerID)
-	if err := t.withContainerMutation(p.ContainerID, "container.destroy", func() error {
-		return t.docker.Destroy(p.ContainerID)
+	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.destroy", func() error {
+		return t.docker.DestroyContext(runtime.ctx, p.ContainerID)
 	}); err != nil {
 		return protocol.TypeContainerDestroy + ".result", nil, err
 	}
 	return protocol.TypeContainerDestroy + ".result", map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleContainerStatus(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerStatus(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerStatus + ".result", nil, err
+	}
 	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerStatus + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
-	status, err := t.docker.ContainerStatus(p.ContainerID)
+	status, err := t.docker.ContainerStatusContext(runtime.ctx, p.ContainerID)
 	if err != nil {
 		return protocol.TypeContainerStatus + ".result", nil, err
 	}
@@ -998,32 +1822,56 @@ func (t *Tunnel) handleContainerStatus(id string, payload json.RawMessage) (stri
 	return protocol.TypeContainerStatus + ".result", map[string]string{"status": status}, nil
 }
 
-func (t *Tunnel) handleContainerExecCommand(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecCommand(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecCommand + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	if t.docker == nil {
 		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("docker client not initialized")
 	}
 	var p protocol.ContainerExecCommandPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec_command container=%s command=%v", p.ContainerID, p.Command)
-	output, err := t.docker.ExecCommand(p.ContainerID, p.Command)
+	output := ""
+	err = runtime.execs.WithContainerExec(p.ContainerID, func() error {
+		var execErr error
+		output, execErr = t.docker.ExecCommandContext(runtime.ctx, p.ContainerID, p.Command)
+		return execErr
+	})
 	if err != nil {
 		return protocol.TypeContainerExecCommand + ".result", nil, err
 	}
 	return protocol.TypeContainerExecCommand + ".result", map[string]string{"output": output}, nil
 }
 
-func (t *Tunnel) handleContainerExecWithStdin(id string, payload json.RawMessage) (string, any, error) {
+func (t *Tunnel) handleContainerExecWithStdin(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeContainerExecWithStdin + ".result", nil, err
+	}
+	if runtime.execs == nil {
+		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
+	}
 	if t.docker == nil {
 		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("docker client not initialized")
 	}
 	var p protocol.ContainerExecWithStdinPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
 	}
 	log.Printf("[relay-node] rpc container.exec_with_stdin container=%s command=%v", p.ContainerID, p.Command)
-	output, err := t.docker.ExecWithStdin(p.ContainerID, p.Command, p.Stdin)
+	output := ""
+	err = runtime.execs.WithContainerExec(p.ContainerID, func() error {
+		var execErr error
+		output, execErr = t.docker.ExecWithStdinContext(runtime.ctx, p.ContainerID, p.Command, p.Stdin)
+		return execErr
+	})
 	if err != nil {
 		return protocol.TypeContainerExecWithStdin + ".result", nil, err
 	}
@@ -1032,83 +1880,111 @@ func (t *Tunnel) handleContainerExecWithStdin(id string, payload json.RawMessage
 
 // --- File message handlers ---
 
-func (t *Tunnel) handleFileRead(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileReadPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileRead(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileReadResult, nil, err
 	}
-	result, err := fileops.Read(&p)
+	var p protocol.FileReadPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileReadResult, nil, err
+	}
+	result, err := fileops.ReadContext(runtime.ctx, &p)
 	if err != nil {
 		return protocol.TypeFileReadResult, nil, err
 	}
 	return protocol.TypeFileReadResult, result, nil
 }
 
-func (t *Tunnel) handleFileWrite(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileWritePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileWrite(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileWriteResult, nil, err
 	}
-	result, err := fileops.Write(&p)
+	var p protocol.FileWritePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileWriteResult, nil, err
+	}
+	result, err := fileops.WriteContext(runtime.ctx, &p)
 	if err != nil {
 		return protocol.TypeFileWriteResult, nil, err
 	}
 	return protocol.TypeFileWriteResult, result, nil
 }
 
-func (t *Tunnel) handleFileStat(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileStatPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileStat(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileStatResult, nil, err
 	}
-	result, err := fileops.Stat(&p)
+	var p protocol.FileStatPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileStatResult, nil, err
+	}
+	result, err := fileops.StatContext(runtime.ctx, &p)
 	if err != nil {
 		return protocol.TypeFileStatResult, nil, err
 	}
 	return protocol.TypeFileStatResult, result, nil
 }
 
-func (t *Tunnel) handleFileGlob(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileGlobPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileGlob(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileGlobResult, nil, err
 	}
-	result, err := fileops.Glob(&p)
+	var p protocol.FileGlobPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileGlobResult, nil, err
+	}
+	result, err := fileops.GlobContext(runtime.ctx, &p)
 	if err != nil {
 		return protocol.TypeFileGlobResult, nil, err
 	}
 	return protocol.TypeFileGlobResult, result, nil
 }
 
-func (t *Tunnel) handleFileGrep(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileGrepPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileGrep(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileGrepResult, nil, err
 	}
-	result, err := fileops.Grep(&p)
+	var p protocol.FileGrepPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileGrepResult, nil, err
+	}
+	result, err := fileops.GrepContext(runtime.ctx, &p)
 	if err != nil {
 		return protocol.TypeFileGrepResult, nil, err
 	}
 	return protocol.TypeFileGrepResult, result, nil
 }
 
-func (t *Tunnel) handleFileMkdir(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileMkdirPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileMkdir(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileMkdirResult, nil, err
 	}
-	if err := fileops.Mkdir(&p); err != nil {
+	var p protocol.FileMkdirPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileMkdirResult, nil, err
+	}
+	if err := fileops.MkdirContext(runtime.ctx, &p); err != nil {
 		return protocol.TypeFileMkdirResult, nil, err
 	}
 	return protocol.TypeFileMkdirResult, map[string]string{"status": "ok"}, nil
 }
 
-func (t *Tunnel) handleFileRemove(id string, payload json.RawMessage) (string, any, error) {
-	var p protocol.FileRemovePayload
-	if err := json.Unmarshal(payload, &p); err != nil {
+func (t *Tunnel) handleFileRemove(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
 		return protocol.TypeFileRemoveResult, nil, err
 	}
-	if err := fileops.Remove(&p); err != nil {
+	var p protocol.FileRemovePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileRemoveResult, nil, err
+	}
+	if err := fileops.RemoveContext(runtime.ctx, &p); err != nil {
 		return protocol.TypeFileRemoveResult, nil, err
 	}
 	return protocol.TypeFileRemoveResult, map[string]string{"status": "ok"}, nil

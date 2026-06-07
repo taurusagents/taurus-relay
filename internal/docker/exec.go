@@ -19,6 +19,11 @@ import (
 type ExecOutputCallback func(sessionID string, data []byte)
 type ExecExitCallback func(sessionID string, exitCode int)
 
+var (
+	startExecWithPTY = pty.StartWithSize
+	startExecCmd     = func(cmd *exec.Cmd) error { return cmd.Start() }
+)
+
 type ExecSession struct {
 	ID          string
 	ContainerID string
@@ -26,9 +31,23 @@ type ExecSession struct {
 	stdin       io.WriteCloser
 	tty         bool
 	ptyFile     *os.File
+	outputWG    sync.WaitGroup
 
 	mu    sync.RWMutex
 	alive bool
+}
+
+type containerGate struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	accesses int
+	mutating bool
+}
+
+func newContainerGate() *containerGate {
+	gate := &containerGate{}
+	gate.cond = sync.NewCond(&gate.mu)
+	return gate
 }
 
 func (s *ExecSession) IsAlive() bool {
@@ -115,20 +134,102 @@ func parseSignal(signal string) syscall.Signal {
 type ExecMultiplexer struct {
 	sessions            map[string]*ExecSession
 	sessionsByContainer map[string]map[string]struct{}
-	containerMutations  map[string]int
+	containerGates      map[string]*containerGate
 	mu                  sync.RWMutex
 	onOutput            ExecOutputCallback
 	onExit              ExecExitCallback
+	closed              bool
 }
 
 func NewExecMultiplexer(onOutput ExecOutputCallback, onExit ExecExitCallback) *ExecMultiplexer {
 	return &ExecMultiplexer{
 		sessions:            make(map[string]*ExecSession),
 		sessionsByContainer: make(map[string]map[string]struct{}),
-		containerMutations:  make(map[string]int),
+		containerGates:      make(map[string]*containerGate),
 		onOutput:            onOutput,
 		onExit:              onExit,
 	}
+}
+
+func (m *ExecMultiplexer) gateForContainer(containerID string) *containerGate {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gateForContainerLocked(containerID)
+}
+
+func (m *ExecMultiplexer) gateForContainerLocked(containerID string) *containerGate {
+	gate, ok := m.containerGates[containerID]
+	if !ok {
+		gate = newContainerGate()
+		m.containerGates[containerID] = gate
+	}
+	return gate
+}
+
+func (m *ExecMultiplexer) beginContainerAccess(containerID string) (*containerGate, error) {
+	gate := m.gateForContainer(containerID)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.mutating {
+		return nil, fmt.Errorf("container %s is in lifecycle transition; cannot start exec", containerID)
+	}
+	gate.accesses++
+	return gate, nil
+}
+
+func (m *ExecMultiplexer) endContainerAccess(gate *containerGate) {
+	if gate == nil {
+		return
+	}
+	gate.mu.Lock()
+	gate.accesses--
+	if gate.accesses == 0 {
+		gate.cond.Broadcast()
+	}
+	gate.mu.Unlock()
+}
+
+// WithContainerExec serializes a one-shot container exec against lifecycle
+// mutations without registering a long-lived exec session.
+func (m *ExecMultiplexer) WithContainerExec(containerID string, action func() error) error {
+	gate, err := m.beginContainerAccess(containerID)
+	if err != nil {
+		return err
+	}
+	defer m.endContainerAccess(gate)
+	return action()
+}
+
+func (m *ExecMultiplexer) acquireContainerMutation(containerID string) *containerGate {
+	gate := m.gateForContainer(containerID)
+	gate.mu.Lock()
+	for gate.mutating {
+		gate.cond.Wait()
+	}
+	gate.mutating = true
+	for gate.accesses > 0 {
+		gate.cond.Wait()
+	}
+	gate.mu.Unlock()
+	return gate
+}
+
+func (m *ExecMultiplexer) releaseContainerMutation(gate *containerGate) {
+	if gate == nil {
+		return
+	}
+	gate.mu.Lock()
+	gate.mutating = false
+	gate.cond.Broadcast()
+	gate.mu.Unlock()
+}
+
+// WithContainerMutation serializes a lifecycle mutation against in-flight
+// container exec launches and one-shot exec commands.
+func (m *ExecMultiplexer) WithContainerMutation(containerID string, action func() error) error {
+	gate := m.acquireContainerMutation(containerID)
+	defer m.releaseContainerMutation(gate)
+	return action()
 }
 
 func (m *ExecMultiplexer) addSessionLocked(sess *ExecSession) {
@@ -156,33 +257,26 @@ func (m *ExecMultiplexer) removeSessionLocked(sessionID string) *ExecSession {
 	return sess
 }
 
-func (m *ExecMultiplexer) registerSession(containerID, sessionID string, sess *ExecSession) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.sessions[sessionID]; exists {
-		return fmt.Errorf("exec session %s already exists", sessionID)
-	}
-	if m.containerMutations[containerID] > 0 {
-		_ = sess.Kill()
-		return fmt.Errorf("container %s is in lifecycle transition; cannot start exec session", containerID)
-	}
-	m.addSessionLocked(sess)
-	return nil
-}
-
 func (m *ExecMultiplexer) BeginContainerMutation(containerID string) {
-	m.mu.Lock()
-	m.containerMutations[containerID] = m.containerMutations[containerID] + 1
-	m.mu.Unlock()
+	gate := m.gateForContainer(containerID)
+	gate.mu.Lock()
+	gate.mutating = true
+	gate.mu.Unlock()
 }
 
 func (m *ExecMultiplexer) EndContainerMutation(containerID string) {
+	gate := m.gateForContainer(containerID)
+	gate.mu.Lock()
+	gate.mutating = false
+	gate.cond.Broadcast()
+	gate.mu.Unlock()
+}
+
+// Close retires the multiplexer so stale runtime snapshots cannot launch new
+// docker exec sessions while reset is still tearing the old runtime down.
+func (m *ExecMultiplexer) Close() {
 	m.mu.Lock()
-	if n := m.containerMutations[containerID]; n <= 1 {
-		delete(m.containerMutations, containerID)
-	} else {
-		m.containerMutations[containerID] = n - 1
-	}
+	m.closed = true
 	m.mu.Unlock()
 }
 
@@ -209,17 +303,25 @@ func (m *ExecMultiplexer) countForContainer(containerID string) int {
 }
 
 func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []string, cwd string, env map[string]string, tty bool, cols, rows uint16) error {
+	gate, err := m.beginContainerAccess(containerID)
+	if err != nil {
+		return err
+	}
+	defer m.endContainerAccess(gate)
+
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("exec multiplexer closed")
+	}
 	if _, exists := m.sessions[sessionID]; exists {
 		m.mu.Unlock()
 		return fmt.Errorf("exec session %s already exists", sessionID)
 	}
-	if m.containerMutations[containerID] > 0 {
-		m.mu.Unlock()
-		return fmt.Errorf("container %s is in lifecycle transition; cannot start exec session", containerID)
-	}
-	m.mu.Unlock()
 
+	// Hold the mux lock across docker exec launch and registration so runtime
+	// reset cannot close this retired mux in the gap between validation and the
+	// actual child-process start.
 	if command == "" {
 		command = "bash"
 	}
@@ -245,8 +347,9 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 		if cols > 0 && rows > 0 {
 			winsize = &pty.Winsize{Cols: cols, Rows: rows}
 		}
-		ptmx, err := pty.StartWithSize(cmd, winsize)
+		ptmx, err := startExecWithPTY(cmd, winsize)
 		if err != nil {
+			m.mu.Unlock()
 			log.Printf("[relay-node/exec] start failed session=%s container=%s: %v", sessionID, containerID, err)
 			return fmt.Errorf("start docker exec with pty: %w", err)
 		}
@@ -260,31 +363,31 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 			ptyFile:     ptmx,
 			alive:       true,
 		}
-
-		if err := m.registerSession(containerID, sessionID, sess); err != nil {
-			_ = sess.Kill()
-			go func() { _ = sess.cmd.Wait() }()
-			return err
-		}
-
-		go m.streamOutput(sessionID, ptmx)
-		go m.wait(sessionID, sess)
+		sess.outputWG.Add(1)
+		m.addSessionLocked(sess)
+		m.mu.Unlock()
+		go m.streamOutput(sess, ptmx)
+		go m.wait(sess)
 		return nil
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startExecCmd(cmd); err != nil {
+		m.mu.Unlock()
 		log.Printf("[relay-node/exec] start failed session=%s container=%s: %v", sessionID, containerID, err)
 		return fmt.Errorf("start docker exec: %w", err)
 	}
@@ -297,27 +400,24 @@ func (m *ExecMultiplexer) Create(containerID, sessionID, command string, args []
 		tty:         false,
 		alive:       true,
 	}
-
-	if err := m.registerSession(containerID, sessionID, sess); err != nil {
-		_ = sess.Kill()
-		go func() { _ = sess.cmd.Wait() }()
-		return err
-	}
-
-	go m.streamOutput(sessionID, stdout)
-	go m.streamOutput(sessionID, stderr)
-	go m.wait(sessionID, sess)
+	sess.outputWG.Add(2)
+	m.addSessionLocked(sess)
+	m.mu.Unlock()
+	go m.streamOutput(sess, stdout)
+	go m.streamOutput(sess, stderr)
+	go m.wait(sess)
 	return nil
 }
 
-func (m *ExecMultiplexer) streamOutput(sessionID string, r io.Reader) {
+func (m *ExecMultiplexer) streamOutput(sess *ExecSession, r io.Reader) {
+	defer sess.outputWG.Done()
 	buf := make([]byte, 8192)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 && m.onOutput != nil {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
-			m.onOutput(sessionID, chunk)
+			m.onOutput(sess.ID, chunk)
 		}
 		if err != nil {
 			return
@@ -325,11 +425,8 @@ func (m *ExecMultiplexer) streamOutput(sessionID string, r io.Reader) {
 	}
 }
 
-func (m *ExecMultiplexer) wait(sessionID string, sess *ExecSession) {
+func (m *ExecMultiplexer) wait(sess *ExecSession) {
 	err := sess.cmd.Wait()
-	if sess.ptyFile != nil {
-		_ = sess.ptyFile.Close()
-	}
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -339,15 +436,19 @@ func (m *ExecMultiplexer) wait(sessionID string, sess *ExecSession) {
 		}
 	}
 	sess.setAlive(false)
-	log.Printf("[relay-node/exec] exit session=%s container=%s exit_code=%d err=%v", sessionID, sess.ContainerID, exitCode, err)
-
-	m.mu.Lock()
-	m.removeSessionLocked(sessionID)
-	m.mu.Unlock()
+	log.Printf("[relay-node/exec] exit session=%s container=%s exit_code=%d err=%v", sess.ID, sess.ContainerID, exitCode, err)
+	sess.outputWG.Wait()
+	if sess.ptyFile != nil {
+		_ = sess.ptyFile.Close()
+	}
 
 	if m.onExit != nil {
-		m.onExit(sessionID, exitCode)
+		m.onExit(sess.ID, exitCode)
 	}
+
+	m.mu.Lock()
+	m.removeSessionLocked(sess.ID)
+	m.mu.Unlock()
 }
 
 func (m *ExecMultiplexer) Get(sessionID string) (*ExecSession, error) {
@@ -425,9 +526,12 @@ func (m *ExecMultiplexer) KillAll() {
 	for _, s := range m.sessions {
 		sessions = append(sessions, s)
 	}
+	// Reset retires the entire runtime. Close this mux before clearing maps so
+	// stale snapshots cannot start a new docker exec on the old runtime.
+	m.closed = true
 	m.sessions = make(map[string]*ExecSession)
 	m.sessionsByContainer = make(map[string]map[string]struct{})
-	m.containerMutations = make(map[string]int)
+	m.containerGates = make(map[string]*containerGate)
 	m.mu.Unlock()
 
 	for _, s := range sessions {

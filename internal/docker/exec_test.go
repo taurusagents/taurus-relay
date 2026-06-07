@@ -1,7 +1,9 @@
 package docker
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,16 @@ func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 	}
 }
 
+func installFakeDocker(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	scriptPath := filepath.Join(binDir, "docker")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestExecMultiplexerWaitRemovesContainerIndex(t *testing.T) {
 	m := NewExecMultiplexer(nil, nil)
 	cmd := exec.Command("bash", "-lc", "exit 0")
@@ -33,7 +45,7 @@ func TestExecMultiplexerWaitRemovesContainerIndex(t *testing.T) {
 	m.addSessionLocked(sess)
 	m.mu.Unlock()
 
-	go m.wait(sess.ID, sess)
+	go m.wait(sess)
 
 	waitFor(t, time.Second, func() bool {
 		return m.Count() == 0 && m.countForContainer("c1") == 0
@@ -52,7 +64,7 @@ func TestExecMultiplexerKillByContainerKillsAndReaps(t *testing.T) {
 	m.addSessionLocked(sess)
 	m.mu.Unlock()
 
-	go m.wait(sess.ID, sess)
+	go m.wait(sess)
 
 	killed, err := m.KillByContainer("c2", 1000)
 	if err != nil {
@@ -78,4 +90,54 @@ func TestExecMultiplexerMutationBlocksCreate(t *testing.T) {
 	if !strings.Contains(err.Error(), "lifecycle transition") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestExecMultiplexerCloseWaitsForInFlightCreateLaunch(t *testing.T) {
+	installFakeDocker(t)
+	originalStart := startExecCmd
+	reachedStart := make(chan struct{})
+	releaseStart := make(chan struct{})
+	startExecCmd = func(cmd *exec.Cmd) error {
+		close(reachedStart)
+		<-releaseStart
+		return originalStart(cmd)
+	}
+	t.Cleanup(func() {
+		startExecCmd = originalStart
+	})
+
+	m := NewExecMultiplexer(nil, nil)
+	createDone := make(chan error, 1)
+	go func() {
+		createDone <- m.Create("c4", "s4", "bash", []string{"-lc", "exit 0"}, "", nil, false, 0, 0)
+	}()
+
+	<-reachedStart
+
+	closeDone := make(chan struct{})
+	go func() {
+		m.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+		t.Fatalf("Close returned while Create was still inside its launch critical section")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseStart)
+	if err := <-createDone; err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatalf("Close did not complete after Create left the launch critical section")
+	}
+
+	if m.Count() != 1 {
+		t.Fatalf("expected launched exec session to be registered before Close completed, got %d session(s)", m.Count())
+	}
+	m.KillAll()
 }

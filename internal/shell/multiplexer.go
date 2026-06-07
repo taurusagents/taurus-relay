@@ -14,6 +14,7 @@ type Multiplexer struct {
 	onOutput    OutputCallback
 	onExit      ExitCallback
 	MaxSessions int
+	closed      bool
 }
 
 // NewMultiplexer creates a new shell multiplexer.
@@ -31,6 +32,9 @@ func (m *Multiplexer) Create(id, shell string, args []string, cwd string, env ma
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.closed {
+		return nil, fmt.Errorf("shell multiplexer closed")
+	}
 	if _, exists := m.sessions[id]; exists {
 		return nil, fmt.Errorf("session %s already exists", id)
 	}
@@ -40,14 +44,16 @@ func (m *Multiplexer) Create(id, shell string, args []string, cwd string, env ma
 	}
 
 	sess, err := NewSession(id, shell, args, cwd, env, m.onOutput, func(sessionID string, exitCode int) {
-		// Clean up from map when process exits
-		m.mu.Lock()
-		delete(m.sessions, sessionID)
-		m.mu.Unlock()
-
 		if m.onExit != nil {
 			m.onExit(sessionID, exitCode)
 		}
+
+		// Keep the session registered until the tunnel has published the final
+		// exit state so same-ID reuse cannot slip into the gap between exit and
+		// output-queue completion bookkeeping.
+		m.mu.Lock()
+		delete(m.sessions, sessionID)
+		m.mu.Unlock()
 	})
 	if err != nil {
 		return nil, err
@@ -83,6 +89,14 @@ func (m *Multiplexer) Kill(id string) error {
 	return sess.Kill()
 }
 
+// Close retires the multiplexer so stale runtime snapshots cannot launch new
+// sessions while reset is still tearing the old runtime down.
+func (m *Multiplexer) Close() {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+}
+
 // KillAll terminates all sessions.
 func (m *Multiplexer) KillAll() {
 	m.mu.Lock()
@@ -90,6 +104,9 @@ func (m *Multiplexer) KillAll() {
 	for _, s := range m.sessions {
 		sessions = append(sessions, s)
 	}
+	// Reset retires the runtime generation, so any stale snapshot still holding
+	// this mux must fail future Create calls instead of launching a hidden shell.
+	m.closed = true
 	m.sessions = make(map[string]*Session)
 	m.mu.Unlock()
 
