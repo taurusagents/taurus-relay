@@ -17,23 +17,16 @@ It connects remote machines to a Taurus control plane over WebSocket and support
 
 ### Node mode
 - Node registration with enrollment token
-- Docker container lifecycle:
-  - `container.ensure`
-  - `container.pause`
-  - `container.unpause`
-  - `container.stop`
-  - `container.destroy`
-  - `container.status`
-- Streaming `docker exec` sessions for Taurus agent shells
-- Node capacity heartbeat (RAM / CPU / disk / running container count)
+- Generic `proc.*` execution with stdout/stderr streaming, stdin, resize, signal, kill, and liveness checks
+- Existing host-side `file.*` operations for Taurus setup and dashboard flows
+- Node capacity heartbeat (RAM / CPU / disk)
 - File reads from the node data path for dashboard proxying
 
 ## Requirements
 
 - Go 1.22+
 - For **node** mode:
-  - Docker installed and available in `PATH`
-  - the relay process user must be able to run `docker`
+  - Taurus is expected to drive any host tooling it needs (for example Docker) through generic `proc.*`
 
 ## Build
 

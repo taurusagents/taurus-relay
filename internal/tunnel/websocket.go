@@ -19,7 +19,6 @@ import (
 
 	"github.com/taurusagents/taurus-relay/internal/auth"
 	"github.com/taurusagents/taurus-relay/internal/config"
-	"github.com/taurusagents/taurus-relay/internal/docker"
 	"github.com/taurusagents/taurus-relay/internal/fileops"
 	"github.com/taurusagents/taurus-relay/internal/health"
 	"github.com/taurusagents/taurus-relay/internal/proc"
@@ -35,11 +34,10 @@ const (
 )
 
 const (
-	controlQueueSize           = 256
-	sessionQueueMaxMessages    = 128
-	sessionQueueMaxBytes       = 1024 * 1024 // 1 MiB per session
-	containerExecReapTimeoutMs = 3000
-	priorityBurstLimit         = 8 // let normal traffic through after a short priority burst
+	controlQueueSize        = 256
+	sessionQueueMaxMessages = 128
+	sessionQueueMaxBytes    = 1024 * 1024 // 1 MiB per session
+	priorityBurstLimit      = 8           // let normal traffic through after a short priority burst
 )
 
 type queuedOutput struct {
@@ -73,7 +71,6 @@ type NodeOptions struct {
 type runtimeSnapshot struct {
 	ctx    context.Context
 	shells *shell.Multiplexer
-	execs  *docker.ExecMultiplexer
 	procs  *proc.Multiplexer
 }
 
@@ -101,9 +98,7 @@ type Tunnel struct {
 	handler *protocol.Handler
 
 	shells *shell.Multiplexer
-	execs  *docker.ExecMultiplexer
 	procs  *proc.Multiplexer
-	docker *docker.Client
 
 	priorityControlQ chan *protocol.Message
 	normalControlQ   chan *protocol.Message
@@ -131,9 +126,8 @@ type Tunnel struct {
 type outputSessionNamespace string
 
 const (
-	outputSessionNamespaceShell         outputSessionNamespace = "shell"
-	outputSessionNamespaceProc          outputSessionNamespace = "proc"
-	outputSessionNamespaceContainerExec outputSessionNamespace = "container.exec"
+	outputSessionNamespaceShell outputSessionNamespace = "shell"
+	outputSessionNamespaceProc  outputSessionNamespace = "proc"
 )
 
 func outputSessionQueueKey(namespace outputSessionNamespace, sessionID string) string {
@@ -141,8 +135,8 @@ func outputSessionQueueKey(namespace outputSessionNamespace, sessionID string) s
 		return ""
 	}
 	// Queue state is shared across all streamed APIs in a tunnel. Scope it by API
-	// family so proc/container.exec/shell can safely reuse the same bare
-	// session_id without inheriting each other's buffered-output completion state.
+	// family so proc/shell can safely reuse the same bare session_id without
+	// inheriting each other's buffered-output completion state.
 	return string(namespace) + "\x00" + sessionID
 }
 
@@ -332,7 +326,6 @@ func (t *Tunnel) runtimeSnapshotForGeneration(generation uint64) (runtimeSnapsho
 	return runtimeSnapshot{
 		ctx:    t.runtimeCtx,
 		shells: t.shells,
-		execs:  t.execs,
 		procs:  t.procs,
 	}, nil
 }
@@ -359,20 +352,8 @@ func (t *Tunnel) procsForMessage(msg *protocol.Message) (*proc.Multiplexer, erro
 	return runtime.procs, nil
 }
 
-func (t *Tunnel) execsForMessage(msg *protocol.Message) (*docker.ExecMultiplexer, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return nil, err
-	}
-	if runtime.execs == nil {
-		return nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	return runtime.execs, nil
-}
-
 func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
 	t.shells = nil
-	t.execs = nil
 	t.procs = nil
 
 	if t.mode == ModeConnect {
@@ -395,24 +376,6 @@ func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
 	}
 
 	if t.mode == ModeNode && t.node != nil {
-		if t.docker == nil {
-			t.docker = docker.NewClient(t.node.DataPath)
-		}
-		t.execs = docker.NewExecMultiplexer(
-			func(sessionID string, data []byte) {
-				payload, _ := json.Marshal(protocol.ShellOutputPayload{
-					SessionID: sessionID,
-					Data:      base64.StdEncoding.EncodeToString(data),
-				})
-				msg := &protocol.Message{Type: protocol.TypeContainerExecOutput, Payload: payload}
-				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceContainerExec, sessionID, protocol.PriorityNormal, msg, len(payload))
-			},
-			func(sessionID string, exitCode int) {
-				t.markOutputSessionCompleteFor(outputSessionNamespaceContainerExec, sessionID)
-				payload, _ := json.Marshal(protocol.ShellExitPayload{SessionID: sessionID, ExitCode: exitCode})
-				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceContainerExec, sessionID, protocol.PriorityNormal, &protocol.Message{Type: protocol.TypeContainerExecExit, Payload: payload}, len(payload))
-			},
-		)
 		t.procs = proc.NewMultiplexer(
 			func(sessionID, stream string, data []byte, priority string) {
 				payload, _ := json.Marshal(protocol.ProcOutputPayload{
@@ -456,20 +419,6 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeProcSignal, t.handleProcSignal)
 		h.Register(protocol.TypeProcKill, t.handleProcKill)
 		h.Register(protocol.TypeProcCheckAlive, t.handleProcCheckAlive)
-		h.Register(protocol.TypeContainerEnsure, t.handleContainerEnsure)
-		h.Register(protocol.TypeContainerExec, t.handleContainerExec)
-		h.Register(protocol.TypeContainerExecStdin, t.handleContainerExecStdin)
-		h.Register(protocol.TypeContainerExecResize, t.handleContainerExecResize)
-		h.Register(protocol.TypeContainerExecSignal, t.handleContainerExecSignal)
-		h.Register(protocol.TypeContainerExecKill, t.handleContainerExecKill)
-		h.Register(protocol.TypeContainerExecCheckAlive, t.handleContainerExecCheckAlive)
-		h.Register(protocol.TypeContainerPause, t.handleContainerPause)
-		h.Register(protocol.TypeContainerUnpause, t.handleContainerUnpause)
-		h.Register(protocol.TypeContainerStop, t.handleContainerStop)
-		h.Register(protocol.TypeContainerDestroy, t.handleContainerDestroy)
-		h.Register(protocol.TypeContainerStatus, t.handleContainerStatus)
-		h.Register(protocol.TypeContainerExecCommand, t.handleContainerExecCommand)
-		h.Register(protocol.TypeContainerExecWithStdin, t.handleContainerExecWithStdin)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -560,16 +509,12 @@ func (t *Tunnel) resetRuntimeState() {
 	t.runtimeMu.Lock()
 	prevCancel := t.runtimeCancel
 	oldShells := t.shells
-	oldExecs := t.execs
 	oldProcs := t.procs
 	// Retire the old muxes at the reset boundary before we cancel and tear the
 	// runtime down. Stale handlers can keep these pointers, so they must reject
 	// new Create/Spawn calls immediately instead of waiting for KillAll().
 	if oldShells != nil {
 		oldShells.Close()
-	}
-	if oldExecs != nil {
-		oldExecs.Close()
 	}
 	if oldProcs != nil {
 		oldProcs.Close()
@@ -598,9 +543,6 @@ func (t *Tunnel) resetRuntimeState() {
 	t.outputMu.Unlock()
 	if oldShells != nil {
 		oldShells.KillAll()
-	}
-	if oldExecs != nil {
-		oldExecs.KillAll()
 	}
 	if oldProcs != nil {
 		oldProcs.KillAll()
@@ -794,21 +736,14 @@ func (t *Tunnel) readAuthResponse() (*protocol.Message, error) {
 func (t *Tunnel) heartbeatInfo() *protocol.HeartbeatPayload {
 	if t.mode == ModeNode {
 		sessions := 0
-		if t.execs != nil {
-			sessions += t.execs.Count()
-		}
 		if t.procs != nil {
 			sessions += t.procs.Count()
 		}
-		containerCount := 0
 		dataPath := "/"
 		if t.node != nil {
 			dataPath = t.node.DataPath
 		}
-		if t.docker != nil {
-			containerCount = t.docker.RunningContainerCount()
-		}
-		return health.NodeSysInfo(sessions, dataPath, containerCount)
+		return health.NodeSysInfo(sessions, dataPath, 0)
 	}
 	sessions := 0
 	if t.shells != nil {
@@ -1543,360 +1478,6 @@ func (t *Tunnel) handleProcCheckAlive(msg *protocol.Message) (string, any, error
 	}
 	log.Printf("[relay-node] rpc proc.check_alive session=%s alive=%t", p.SessionID, alive)
 	return protocol.TypeProcCheckAliveResult, map[string]bool{"alive": alive}, nil
-}
-
-// --- Container message handlers ---
-
-func (t *Tunnel) handleContainerEnsure(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerEnsure + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	if t.docker == nil {
-		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("docker client not initialized")
-	}
-	var p protocol.ContainerEnsurePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerEnsure + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	image := p.Image
-	if image == "" {
-		image = p.DockerImage
-	}
-	log.Printf("[relay-node] rpc container.ensure container=%s image=%s user=%s agent=%s", p.ContainerID, image, p.UserID, p.AgentID)
-	err = runtime.execs.WithContainerMutation(p.ContainerID, func() error {
-		status, err := t.docker.ContainerStatusContext(runtime.ctx, p.ContainerID)
-		if err != nil {
-			return err
-		}
-		if status == docker.StatusRunning {
-			return nil
-		}
-		if err := t.terminateContainerExecSessions(runtime.execs, p.ContainerID, protocol.TypeContainerEnsure); err != nil {
-			return fmt.Errorf("terminate container exec sessions: %w", err)
-		}
-		return t.docker.EnsureContainerContext(runtime.ctx, docker.EnsureOptions{
-			ContainerID: p.ContainerID,
-			Image:       image,
-			UserID:      p.UserID,
-			AgentID:     p.AgentID,
-			RootAgentID: p.RootAgentID,
-			ResourceLimits: docker.ResourceLimits{
-				CPUs:      p.ResourceLimits.CPUs,
-				MemoryMB:  p.ResourceLimits.MemoryMB,
-				PidsLimit: p.ResourceLimits.PidsLimit,
-			},
-			Mounts: mapMounts(p.Mounts),
-		})
-	})
-	if err != nil {
-		return protocol.TypeContainerEnsure + ".result", nil, err
-	}
-	return protocol.TypeContainerEnsure + ".result", map[string]string{"status": "running", "container_id": p.ContainerID}, nil
-}
-
-func mapMounts(in []protocol.DockerMount) []docker.Mount {
-	out := make([]docker.Mount, 0, len(in))
-	for _, m := range in {
-		out = append(out, docker.Mount{Host: m.Host, Container: m.Container, Readonly: m.Readonly})
-	}
-	return out
-}
-
-func (t *Tunnel) handleContainerExec(msg *protocol.Message) (string, any, error) {
-	execs, err := t.execsForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExec + ".result", nil, err
-	}
-	var p protocol.ContainerExecPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	if t.outputSessionStateExists(outputSessionNamespaceContainerExec, p.SessionID) {
-		return protocol.TypeContainerExec + ".result", nil, fmt.Errorf("container exec session %s still has queued output from the previous run", p.SessionID)
-	}
-	log.Printf("[relay-node] rpc container.exec container=%s session=%s command=%s", p.ContainerID, p.SessionID, p.Command)
-	if err := execs.Create(p.ContainerID, p.SessionID, p.Command, p.Args, p.CWD, p.Env, p.Tty, p.Cols, p.Rows); err != nil {
-		return protocol.TypeContainerExec + ".result", nil, err
-	}
-	return protocol.TypeContainerExec + ".result", map[string]string{"status": "started", "session_id": p.SessionID}, nil
-}
-
-func (t *Tunnel) handleContainerExecStdin(msg *protocol.Message) (string, any, error) {
-	execs, err := t.execsForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecStdin + ".result", nil, err
-	}
-	var p protocol.ContainerExecStdinPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec.stdin session=%s", p.SessionID)
-	sess, err := execs.Get(p.SessionID)
-	if err != nil {
-		return protocol.TypeContainerExecStdin + ".result", nil, err
-	}
-	if err := sess.WriteStdinBase64(p.Data); err != nil {
-		return protocol.TypeContainerExecStdin + ".result", nil, err
-	}
-	return protocol.TypeContainerExecStdin + ".result", nil, nil
-}
-
-func (t *Tunnel) handleContainerExecResize(msg *protocol.Message) (string, any, error) {
-	execs, err := t.execsForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecResize + ".result", nil, err
-	}
-	var p protocol.ContainerExecResizePayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecResize + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec.resize session=%s cols=%d rows=%d", p.SessionID, p.Cols, p.Rows)
-	if err := execs.Resize(p.SessionID, p.Cols, p.Rows); err != nil {
-		return protocol.TypeContainerExecResize + ".result", nil, err
-	}
-	return protocol.TypeContainerExecResize + ".result", nil, nil
-}
-
-func (t *Tunnel) handleContainerExecSignal(msg *protocol.Message) (string, any, error) {
-	execs, err := t.execsForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecSignal + ".result", nil, err
-	}
-	var p protocol.ContainerExecSignalPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecSignal + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec.signal session=%s signal=%s shell_pid=%d", p.SessionID, p.Signal, p.ShellPID)
-	sess, err := execs.Get(p.SessionID)
-	if err != nil {
-		return protocol.TypeContainerExecSignal + ".result", nil, err
-	}
-	if err := sess.Signal(p.Signal, p.ShellPID); err != nil {
-		return protocol.TypeContainerExecSignal + ".result", nil, err
-	}
-	return protocol.TypeContainerExecSignal + ".result", nil, nil
-}
-
-func (t *Tunnel) handleContainerExecKill(msg *protocol.Message) (string, any, error) {
-	execs, err := t.execsForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecKill + ".result", nil, err
-	}
-	var p protocol.ContainerExecKillPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecKill + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec.kill session=%s", p.SessionID)
-	if err := execs.Kill(p.SessionID); err != nil {
-		return protocol.TypeContainerExecKill + ".result", nil, err
-	}
-	return protocol.TypeContainerExecKill + ".result", nil, nil
-}
-
-func (t *Tunnel) handleContainerExecCheckAlive(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecCheckAlive + ".result", nil, err
-	}
-	var p protocol.ContainerExecKillPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecCheckAlive + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	alive := runtime.execs != nil && runtime.execs.CheckAlive(p.SessionID)
-	log.Printf("[relay-node] rpc container.exec.check_alive session=%s alive=%t", p.SessionID, alive)
-	return protocol.TypeContainerExecCheckAlive + ".result", map[string]bool{"alive": alive}, nil
-}
-
-func (t *Tunnel) terminateContainerExecSessions(execs *docker.ExecMultiplexer, containerID, lifecycleOp string) error {
-	if execs == nil {
-		return nil
-	}
-	killed, err := execs.KillByContainer(containerID, containerExecReapTimeoutMs)
-	if err != nil {
-		log.Printf("[relay-node] rpc %s container=%s exec_cleanup_failed killed=%d err=%v", lifecycleOp, containerID, killed, err)
-		return err
-	}
-	if killed > 0 {
-		log.Printf("[relay-node] rpc %s container=%s exec_cleanup_killed=%d", lifecycleOp, containerID, killed)
-	}
-	return nil
-}
-
-func (t *Tunnel) withContainerMutationUsingExecs(execs *docker.ExecMultiplexer, containerID, lifecycleOp string, action func() error) error {
-	if execs == nil {
-		return action()
-	}
-	return execs.WithContainerMutation(containerID, func() error {
-		if err := t.terminateContainerExecSessions(execs, containerID, lifecycleOp); err != nil {
-			return fmt.Errorf("terminate container exec sessions: %w", err)
-		}
-		return action()
-	})
-}
-
-func (t *Tunnel) withContainerMutation(containerID, lifecycleOp string, action func() error) error {
-	return t.withContainerMutationUsingExecs(t.execs, containerID, lifecycleOp, action)
-}
-
-func (t *Tunnel) handleContainerPause(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerPause + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerPause + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.pause container=%s", p.ContainerID)
-	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.pause", func() error {
-		return t.docker.PauseContext(runtime.ctx, p.ContainerID)
-	}); err != nil {
-		return protocol.TypeContainerPause + ".result", nil, err
-	}
-	return protocol.TypeContainerPause + ".result", map[string]string{"status": "ok"}, nil
-}
-
-func (t *Tunnel) handleContainerUnpause(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerUnpause + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerUnpause + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerUnpause + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.unpause container=%s", p.ContainerID)
-	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.unpause", func() error {
-		return t.docker.UnpauseContext(runtime.ctx, p.ContainerID)
-	}); err != nil {
-		return protocol.TypeContainerUnpause + ".result", nil, err
-	}
-	return protocol.TypeContainerUnpause + ".result", map[string]string{"status": "ok"}, nil
-}
-
-func (t *Tunnel) handleContainerStop(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerStop + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerStop + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.stop container=%s", p.ContainerID)
-	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.stop", func() error {
-		return t.docker.StopContext(runtime.ctx, p.ContainerID)
-	}); err != nil {
-		return protocol.TypeContainerStop + ".result", nil, err
-	}
-	return protocol.TypeContainerStop + ".result", map[string]string{"status": "ok"}, nil
-}
-
-func (t *Tunnel) handleContainerDestroy(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerDestroy + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerDestroy + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.destroy container=%s", p.ContainerID)
-	if err := t.withContainerMutationUsingExecs(runtime.execs, p.ContainerID, "container.destroy", func() error {
-		return t.docker.DestroyContext(runtime.ctx, p.ContainerID)
-	}); err != nil {
-		return protocol.TypeContainerDestroy + ".result", nil, err
-	}
-	return protocol.TypeContainerDestroy + ".result", map[string]string{"status": "ok"}, nil
-}
-
-func (t *Tunnel) handleContainerStatus(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerStatus + ".result", nil, err
-	}
-	var p protocol.ContainerIDPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerStatus + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	status, err := t.docker.ContainerStatusContext(runtime.ctx, p.ContainerID)
-	if err != nil {
-		return protocol.TypeContainerStatus + ".result", nil, err
-	}
-	log.Printf("[relay-node] rpc container.status container=%s status=%s", p.ContainerID, status)
-	return protocol.TypeContainerStatus + ".result", map[string]string{"status": status}, nil
-}
-
-func (t *Tunnel) handleContainerExecCommand(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecCommand + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	if t.docker == nil {
-		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("docker client not initialized")
-	}
-	var p protocol.ContainerExecCommandPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecCommand + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec_command container=%s command=%v", p.ContainerID, p.Command)
-	output := ""
-	err = runtime.execs.WithContainerExec(p.ContainerID, func() error {
-		var execErr error
-		output, execErr = t.docker.ExecCommandContext(runtime.ctx, p.ContainerID, p.Command)
-		return execErr
-	})
-	if err != nil {
-		return protocol.TypeContainerExecCommand + ".result", nil, err
-	}
-	return protocol.TypeContainerExecCommand + ".result", map[string]string{"output": output}, nil
-}
-
-func (t *Tunnel) handleContainerExecWithStdin(msg *protocol.Message) (string, any, error) {
-	runtime, err := t.runtimeSnapshotForMessage(msg)
-	if err != nil {
-		return protocol.TypeContainerExecWithStdin + ".result", nil, err
-	}
-	if runtime.execs == nil {
-		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("exec multiplexer not initialized")
-	}
-	if t.docker == nil {
-		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("docker client not initialized")
-	}
-	var p protocol.ContainerExecWithStdinPayload
-	if err := json.Unmarshal(msg.Payload, &p); err != nil {
-		return protocol.TypeContainerExecWithStdin + ".result", nil, fmt.Errorf("parse payload: %w", err)
-	}
-	log.Printf("[relay-node] rpc container.exec_with_stdin container=%s command=%v", p.ContainerID, p.Command)
-	output := ""
-	err = runtime.execs.WithContainerExec(p.ContainerID, func() error {
-		var execErr error
-		output, execErr = t.docker.ExecWithStdinContext(runtime.ctx, p.ContainerID, p.Command, p.Stdin)
-		return execErr
-	})
-	if err != nil {
-		return protocol.TypeContainerExecWithStdin + ".result", nil, err
-	}
-	return protocol.TypeContainerExecWithStdin + ".result", map[string]string{"output": output}, nil
 }
 
 // --- File message handlers ---

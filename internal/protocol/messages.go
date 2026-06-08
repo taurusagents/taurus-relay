@@ -253,81 +253,6 @@ type NodeRegisterResultPayload struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type ContainerEnsurePayload struct {
-	ContainerID    string               `json:"container_id"`
-	Image          string               `json:"image,omitempty"`
-	DockerImage    string               `json:"docker_image,omitempty"`
-	UserID         string               `json:"user_id"`
-	AgentID        string               `json:"agent_id"`
-	RootAgentID    string               `json:"root_agent_id"`
-	ResourceLimits DockerResourceLimits `json:"resource_limits,omitempty"`
-	Mounts         []DockerMount        `json:"mounts,omitempty"`
-}
-
-type DockerResourceLimits struct {
-	CPUs      float64 `json:"cpus,omitempty"`
-	MemoryMB  int     `json:"memory_mb,omitempty"`
-	PidsLimit int     `json:"pids_limit,omitempty"`
-}
-
-type DockerMount struct {
-	Host      string `json:"host"`
-	Container string `json:"container"`
-	Readonly  bool   `json:"readonly,omitempty"`
-}
-
-type ContainerExecPayload struct {
-	ContainerID string            `json:"container_id"`
-	SessionID   string            `json:"session_id"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args,omitempty"`
-	CWD         string            `json:"cwd,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	Tty         bool              `json:"tty,omitempty"`
-	Cols        uint16            `json:"cols,omitempty"`
-	Rows        uint16            `json:"rows,omitempty"`
-	Stream      bool              `json:"stream,omitempty"`
-}
-
-type ContainerExecStdinPayload struct {
-	ContainerID string `json:"container_id"`
-	SessionID   string `json:"session_id"`
-	Data        string `json:"data"`
-}
-
-type ContainerExecResizePayload struct {
-	SessionID string `json:"session_id"`
-	Cols      uint16 `json:"cols"`
-	Rows      uint16 `json:"rows"`
-}
-
-type ContainerExecSignalPayload struct {
-	ContainerID string `json:"container_id"`
-	SessionID   string `json:"session_id"`
-	Signal      string `json:"signal"`
-	ShellPID    int    `json:"shell_pid,omitempty"`
-}
-
-type ContainerExecKillPayload struct {
-	ContainerID string `json:"container_id"`
-	SessionID   string `json:"session_id"`
-}
-
-type ContainerExecCommandPayload struct {
-	ContainerID string   `json:"container_id"`
-	Command     []string `json:"command"`
-}
-
-type ContainerExecWithStdinPayload struct {
-	ContainerID string   `json:"container_id"`
-	Command     []string `json:"command"`
-	Stdin       string   `json:"stdin"`
-}
-
-type ContainerIDPayload struct {
-	ContainerID string `json:"container_id"`
-}
-
 // --- Auth payloads ---
 
 // AuthRegistrationPayload is sent inside `type: "auth"` when registering with a one-time token.
@@ -421,23 +346,6 @@ const (
 	TypeAuthResult         = "auth.result"
 	TypeNodeRegister       = "node.register"
 	TypeNodeRegisterResult = "node.register.result"
-
-	TypeContainerEnsure         = "container.ensure"
-	TypeContainerExec           = "container.exec"
-	TypeContainerExecOutput     = "container.exec.output"
-	TypeContainerExecExit       = "container.exec.exit"
-	TypeContainerExecStdin      = "container.exec.stdin"
-	TypeContainerExecResize     = "container.exec.resize"
-	TypeContainerExecSignal     = "container.exec.signal"
-	TypeContainerExecKill       = "container.exec.kill"
-	TypeContainerExecCheckAlive = "container.exec.check_alive"
-	TypeContainerPause          = "container.pause"
-	TypeContainerUnpause        = "container.unpause"
-	TypeContainerStop           = "container.stop"
-	TypeContainerDestroy        = "container.destroy"
-	TypeContainerStatus         = "container.status"
-	TypeContainerExecCommand    = "container.exec_command"
-	TypeContainerExecWithStdin  = "container.exec_with_stdin"
 
 	TypeHeartbeat = "heartbeat"
 	TypePing      = "ping"
