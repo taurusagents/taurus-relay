@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -40,6 +41,10 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 	if err := os.MkdirAll(dataPath, 0o755); err != nil {
 		return fmt.Errorf("create data path: %w", err)
 	}
+	dataPath, err := canonicalizeNodeDataPath(dataPath)
+	if err != nil {
+		return err
+	}
 
 	fileops.AllowedRoots = []string{dataPath}
 	log.Printf("[relay-node] file operations restricted to: %s", dataPath)
@@ -65,4 +70,16 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 	}()
 
 	return tun.Run()
+}
+
+func canonicalizeNodeDataPath(dataPath string) (string, error) {
+	absPath, err := filepath.Abs(dataPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve data path %q: %w", dataPath, err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize data path %q: %w", dataPath, err)
+	}
+	return resolvedPath, nil
 }

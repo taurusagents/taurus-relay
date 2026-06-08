@@ -107,7 +107,7 @@ Subsequent reconnects reuse saved credentials:
 ./taurus-relay connect --server https://your-taurus-host.example
 ```
 
-### Docker node mode
+### Node mode
 
 ```bash
 ./taurus-relay node \
@@ -140,7 +140,7 @@ The Taurus control plane should expose the relay WebSocket endpoint at:
 It should support:
 - regular relay auth / registration for target mode
 - `node.register` auth flow for node mode
-- `container.*` RPC for node mode
+- generic `proc.*` and `file.*` RPC for node mode
 
 ## Development
 

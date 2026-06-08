@@ -23,6 +23,15 @@ const (
 	defaultExecPath    = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+var dockerConnectivityEnvKeys = []string{
+	"DOCKER_HOST",
+	"DOCKER_CONTEXT",
+	"DOCKER_CONFIG",
+	"DOCKER_TLS_VERIFY",
+	"DOCKER_CERT_PATH",
+	"XDG_RUNTIME_DIR",
+}
+
 var (
 	defaultRunTimeoutMs = 120_000
 	maxRunCaptureBytes  = 1 << 20
@@ -149,9 +158,13 @@ func (s *Session) Signal(signal string) error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return fmt.Errorf("session process unavailable")
 	}
+	syssig, err := parseSignal(signal)
+	if err != nil {
+		return err
+	}
 	// proc.signal preserves ChildProcess-style graceful control semantics by
 	// forwarding the requested signal to the session process group.
-	return signalProcessGroup(s.cmd.Process.Pid, parseSignal(signal))
+	return signalProcessGroup(s.cmd.Process.Pid, syssig)
 }
 
 func (s *Session) Resize(cols, rows uint16) error {
@@ -472,6 +485,14 @@ func defaultCommandEnv() []string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		env = append(env, fmt.Sprintf("HOME=%s", home))
 	}
+	// Keep proc commands on a minimal baseline env, but explicitly preserve only
+	// the narrow host variables the Docker CLI may need to reach the operator's
+	// daemon or rootless socket without inheriting the whole service environment.
+	for _, key := range dockerConnectivityEnvKeys {
+		if value := os.Getenv(key); value != "" {
+			env = append(env, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
 	return env
 }
 
@@ -587,15 +608,15 @@ func signalProcessGroup(pid int, sig syscall.Signal) error {
 	return nil
 }
 
-func parseSignal(signal string) syscall.Signal {
-	switch strings.ToUpper(signal) {
+func parseSignal(signal string) (syscall.Signal, error) {
+	switch strings.ToUpper(strings.TrimSpace(signal)) {
 	case "SIGINT", "INT":
-		return syscall.SIGINT
+		return syscall.SIGINT, nil
 	case "SIGTERM", "TERM":
-		return syscall.SIGTERM
+		return syscall.SIGTERM, nil
 	case "SIGKILL", "KILL":
-		return syscall.SIGKILL
+		return syscall.SIGKILL, nil
 	default:
-		return syscall.SIGTERM
+		return 0, fmt.Errorf("unknown signal: %s", signal)
 	}
 }

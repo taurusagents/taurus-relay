@@ -33,11 +33,15 @@ func SysInfo(sessionCount int) *protocol.HeartbeatPayload {
 	}
 }
 
-// NodeSysInfo gathers node-specific heartbeat info used for scheduling.
-func NodeSysInfo(sessionCount int, dataPath string, containerCount int) *protocol.HeartbeatPayload {
+// NodeSysInfo gathers node-specific heartbeat info Taurus still uses for node scheduling.
+func NodeSysInfo(sessionCount int, dataPath string) *protocol.HeartbeatPayload {
 	base := SysInfo(sessionCount)
+	// Taurus still reads container_count from node heartbeats today. The proc-based
+	// node runtime does not launch Taurus containers anymore, but it must keep
+	// publishing an explicit zero so upgraded relays overwrite any stale legacy
+	// value in the control plane instead of leaving capacity accounting ambiguous.
+	base.ContainerCount = 0
 	usedGB, availableGB := memoryUsageGB()
-	base.ContainerCount = containerCount
 	base.MemoryUsedGB = usedGB
 	base.MemoryAvailableGB = availableGB
 	base.CPULoad = cpuLoad()

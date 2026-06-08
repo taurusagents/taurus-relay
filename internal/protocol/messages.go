@@ -233,7 +233,7 @@ type FileRemovePayload struct {
 	Recursive bool   `json:"recursive,omitempty"`
 }
 
-// --- Node and container payloads ---
+// --- Node payloads ---
 
 type NodeRegisterPayload struct {
 	Type             string            `json:"type"`
@@ -288,7 +288,7 @@ type HeartbeatPayload struct {
 	MemoryPercent     float64 `json:"memory_percent"`
 	RelayVersion      string  `json:"relay_version"`
 	Sessions          int     `json:"sessions"`
-	ContainerCount    int     `json:"container_count,omitempty"`
+	ContainerCount    int     `json:"container_count"`
 	MemoryUsedGB      float64 `json:"memory_used_gb,omitempty"`
 	MemoryAvailableGB float64 `json:"memory_available_gb,omitempty"`
 	CPULoad           float64 `json:"cpu_load,omitempty"`

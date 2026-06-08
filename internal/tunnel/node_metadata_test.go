@@ -7,7 +7,7 @@ import (
 	"github.com/taurusagents/taurus-relay/internal/protocol"
 )
 
-func TestBuildNodeRegisterMetaPublishesDriveRootMetadata(t *testing.T) {
+func TestBuildNodeRegisterMetaPublishesCurrentDriveRootMetadata(t *testing.T) {
 	dataPath := filepath.Join(t.TempDir(), ".", "node-data")
 	meta := buildNodeRegisterMeta(dataPath, &protocol.HeartbeatPayload{OS: "linux", Arch: "amd64"}, "node-1")
 
@@ -16,11 +16,14 @@ func TestBuildNodeRegisterMetaPublishesDriveRootMetadata(t *testing.T) {
 	if got := meta["data_root"]; got != cleanDataRoot {
 		t.Fatalf("expected data_root %q, got %q", cleanDataRoot, got)
 	}
-	if got := meta["drive_path"]; got != wantDrivePath {
-		t.Fatalf("expected drive_path %q, got %q", wantDrivePath, got)
-	}
 	if got := meta["taurus_drive_path"]; got != wantDrivePath {
 		t.Fatalf("expected taurus_drive_path %q, got %q", wantDrivePath, got)
+	}
+	if got := meta["container_count"]; got != "0" {
+		t.Fatalf("expected compatibility container_count 0, got %q", got)
+	}
+	if _, ok := meta["drive_path"]; ok {
+		t.Fatalf("expected legacy drive_path metadata to be omitted, got %v", meta)
 	}
 	if got := meta["os"]; got != "linux" {
 		t.Fatalf("expected os linux, got %q", got)

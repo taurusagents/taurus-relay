@@ -668,12 +668,7 @@ func (t *Tunnel) authenticateNode() error {
 		AllocatableRAMGB: ramGB,
 		AllocatableCPUs:  cpus,
 		MaxContainers:    t.node.MaxContainers,
-		Capabilities: map[string]bool{
-			"docker":         true,
-			"fs_read":        true,
-			"exec_streaming": true,
-		},
-		Meta: buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
+		Meta:             buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -704,9 +699,9 @@ func (t *Tunnel) authenticateNode() error {
 	return nil
 }
 
-// buildNodeRegisterMeta publishes both the operator-configured data root and the
-// concrete Taurus drive root so the control plane can derive remote host paths
-// without guessing which node layout it is talking to.
+// buildNodeRegisterMeta publishes the canonical Taurus data root plus the exact
+// current drives root Taurus should use. It also keeps the current Taurus
+// compatibility marker for legacy node-capacity accounting.
 func buildNodeRegisterMeta(dataPath string, sys *protocol.HeartbeatPayload, hostname string) map[string]string {
 	dataRoot := filepath.Clean(dataPath)
 	drivePath := filepath.Join(dataRoot, "taurus-drives")
@@ -715,8 +710,8 @@ func buildNodeRegisterMeta(dataPath string, sys *protocol.HeartbeatPayload, host
 		"os":                sys.OS,
 		"arch":              sys.Arch,
 		"hostname":          hostname,
+		"container_count":   "0",
 		"data_root":         dataRoot,
-		"drive_path":        drivePath,
 		"taurus_drive_path": drivePath,
 	}
 }
@@ -743,7 +738,7 @@ func (t *Tunnel) heartbeatInfo() *protocol.HeartbeatPayload {
 		if t.node != nil {
 			dataPath = t.node.DataPath
 		}
-		return health.NodeSysInfo(sessions, dataPath, 0)
+		return health.NodeSysInfo(sessions, dataPath)
 	}
 	sessions := 0
 	if t.shells != nil {

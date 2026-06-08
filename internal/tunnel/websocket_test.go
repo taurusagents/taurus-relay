@@ -130,6 +130,32 @@ func TestEnqueueControlRoutesPriorityLane(t *testing.T) {
 	}
 }
 
+func TestHeartbeatInfoNodeIncludesExplicitContainerCountCompatibilityField(t *testing.T) {
+	tun := NewNode("https://example.com", NodeOptions{DataPath: t.TempDir()})
+	heartbeat := tun.heartbeatInfo()
+	if heartbeat == nil {
+		t.Fatal("expected heartbeat payload")
+	}
+	if heartbeat.ContainerCount != 0 {
+		t.Fatalf("expected compatibility container_count 0, got %d", heartbeat.ContainerCount)
+	}
+
+	encoded, err := json.Marshal(heartbeat)
+	if err != nil {
+		t.Fatalf("marshal heartbeat: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("unmarshal heartbeat json: %v", err)
+	}
+	if got, ok := payload["container_count"]; !ok {
+		t.Fatalf("expected container_count to be present in heartbeat json: %s", string(encoded))
+	} else if got != float64(0) {
+		t.Fatalf("expected serialized container_count 0, got %#v", got)
+	}
+}
+
 func TestDequeueOutputForPriorityPrefersPrioritySessions(t *testing.T) {
 	tun := &Tunnel{
 		ctx:          context.Background(),
@@ -974,6 +1000,30 @@ func TestProcControlHandlersReturnSuccessAck(t *testing.T) {
 			t.Fatalf("marshal signal payload: %v", err)
 		}
 		assertOKResponse(t, tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcSignal, Payload: payload, Generation: generation}), protocol.TypeProcSignalResult)
+	})
+
+	t.Run("signal rejects unknown signal", func(t *testing.T) {
+		if err := tun.procs.Spawn("signal-invalid", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, protocol.PriorityNormal); err != nil {
+			t.Fatalf("spawn invalid-signal session: %v", err)
+		}
+		defer tun.procs.Kill("signal-invalid")
+		payload, err := json.Marshal(protocol.ProcSignalPayload{SessionID: "signal-invalid", Signal: "definitely-not-a-signal"})
+		if err != nil {
+			t.Fatalf("marshal invalid signal payload: %v", err)
+		}
+		resp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcSignal, Payload: payload, Generation: generation})
+		if resp == nil {
+			t.Fatalf("expected proc.signal error response")
+		}
+		if resp.Type != protocol.TypeProcSignalResult {
+			t.Fatalf("expected response type %s, got %s", protocol.TypeProcSignalResult, resp.Type)
+		}
+		if resp.Error == nil || !strings.Contains(*resp.Error, "unknown signal") {
+			t.Fatalf("expected unknown-signal error, got %#v", resp.Error)
+		}
+		if !tun.procs.CheckAlive("signal-invalid") {
+			t.Fatalf("expected invalid proc.signal to leave the session alive")
+		}
 	})
 
 	t.Run("kill", func(t *testing.T) {

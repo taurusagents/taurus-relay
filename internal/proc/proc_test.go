@@ -118,6 +118,30 @@ func TestRunUsesMinimalBaselineEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunPreservesNarrowDockerConnectivityEnvironment(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/test-docker.sock")
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+	t.Setenv("PROC_RUN_SECRET", "super-secret")
+
+	result, err := Run(context.Background(), []string{"bash", "-lc", "env"}, "", nil, nil, 1000)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !strings.Contains(result.Stdout, "DOCKER_HOST=unix:///tmp/test-docker.sock") {
+		t.Fatalf("expected proc.run to preserve DOCKER_HOST for host-side Docker commands, got %q", result.Stdout)
+	}
+	if !strings.Contains(result.Stdout, "XDG_RUNTIME_DIR=/run/user/1000") {
+		t.Fatalf("expected proc.run to preserve XDG_RUNTIME_DIR for rootless Docker setups, got %q", result.Stdout)
+	}
+	if strings.Contains(result.Stdout, "SSH_AUTH_SOCK=/tmp/agent.sock") {
+		t.Fatalf("expected proc.run not to expose SSH agent sockets globally, got %q", result.Stdout)
+	}
+	if strings.Contains(result.Stdout, "PROC_RUN_SECRET=super-secret") {
+		t.Fatalf("expected proc.run to keep filtering arbitrary host env, got %q", result.Stdout)
+	}
+}
+
 func TestRunTimeoutKillsProcessGroup(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	result, err := Run(
@@ -464,6 +488,20 @@ func TestMultiplexerSignalTargetsProcessGroup(t *testing.T) {
 	waitFor(t, time.Second, func() bool {
 		return !pidAlive(pid)
 	})
+}
+
+func TestMultiplexerSignalRejectsUnknownSignal(t *testing.T) {
+	mux := NewMultiplexer(nil, nil)
+	if err := mux.Spawn("signal-invalid", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, PriorityNormal); err != nil {
+		t.Fatalf("Spawn returned error: %v", err)
+	}
+	defer mux.KillAll()
+	if err := mux.Signal("signal-invalid", "definitely-not-a-signal"); err == nil || !strings.Contains(err.Error(), "unknown signal") {
+		t.Fatalf("expected unknown-signal error, got %v", err)
+	}
+	if !mux.CheckAlive("signal-invalid") {
+		t.Fatalf("expected invalid proc.signal to leave the session running")
+	}
 }
 
 func TestMultiplexerSignalVsKillSemantics(t *testing.T) {
