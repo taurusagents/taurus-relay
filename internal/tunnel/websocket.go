@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -730,11 +731,7 @@ func (t *Tunnel) authenticateNode() error {
 			"fs_read":        true,
 			"exec_streaming": true,
 		},
-		Meta: map[string]string{
-			"os":       sys.OS,
-			"arch":     sys.Arch,
-			"hostname": hostname,
-		},
+		Meta: buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -763,6 +760,23 @@ func (t *Tunnel) authenticateNode() error {
 	}
 	log.Printf("[tunnel] registered node %s", result.NodeID)
 	return nil
+}
+
+// buildNodeRegisterMeta publishes both the operator-configured data root and the
+// concrete Taurus drive root so the control plane can derive remote host paths
+// without guessing which node layout it is talking to.
+func buildNodeRegisterMeta(dataPath string, sys *protocol.HeartbeatPayload, hostname string) map[string]string {
+	dataRoot := filepath.Clean(dataPath)
+	drivePath := filepath.Join(dataRoot, "taurus-drives")
+
+	return map[string]string{
+		"os":                sys.OS,
+		"arch":              sys.Arch,
+		"hostname":          hostname,
+		"data_root":         dataRoot,
+		"drive_path":        drivePath,
+		"taurus_drive_path": drivePath,
+	}
 }
 
 func (t *Tunnel) readAuthResponse() (*protocol.Message, error) {
@@ -1448,13 +1462,20 @@ func (t *Tunnel) handleProcStdin(msg *protocol.Message) (string, any, error) {
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return protocol.TypeProcStdinResult, nil, fmt.Errorf("parse payload: %w", err)
 	}
-	log.Printf("[relay-node] rpc proc.stdin session=%s", p.SessionID)
-	sess, err := procs.Get(p.SessionID)
-	if err != nil {
-		return protocol.TypeProcStdinResult, nil, err
+	log.Printf("[relay-node] rpc proc.stdin session=%s eof=%t", p.SessionID, p.EOF)
+	if p.Data != "" {
+		sess, err := procs.Get(p.SessionID)
+		if err != nil {
+			return protocol.TypeProcStdinResult, nil, err
+		}
+		if err := sess.WriteStdinBase64(p.Data); err != nil {
+			return protocol.TypeProcStdinResult, nil, err
+		}
 	}
-	if err := sess.WriteStdinBase64(p.Data); err != nil {
-		return protocol.TypeProcStdinResult, nil, err
+	if p.EOF {
+		if err := procs.CloseStdin(p.SessionID); err != nil {
+			return protocol.TypeProcStdinResult, nil, err
+		}
 	}
 	return protocol.TypeProcStdinResult, map[string]string{"status": "ok"}, nil
 }

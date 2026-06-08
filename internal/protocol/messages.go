@@ -129,7 +129,10 @@ type ProcSpawnPayload struct {
 
 type ProcStdinPayload struct {
 	SessionID string `json:"session_id"`
-	Data      string `json:"data"`
+	// Data carries base64-encoded stdin bytes for the session.
+	Data string `json:"data,omitempty"`
+	// EOF closes stdin for non-PTY sessions so the remote process can observe end-of-input.
+	EOF bool `json:"eof,omitempty"`
 }
 
 type ProcResizePayload struct {
@@ -140,10 +143,13 @@ type ProcResizePayload struct {
 
 type ProcSignalPayload struct {
 	SessionID string `json:"session_id"`
-	Signal    string `json:"signal"`
+	// Signal is the exact process-group signal to deliver (for example TERM or INT).
+	Signal string `json:"signal"`
 }
 
 type ProcKillPayload struct {
+	// ProcKill is the unconditional hard-kill path; unlike proc.signal it always
+	// maps to SIGKILL at the runtime layer.
 	SessionID string `json:"session_id"`
 }
 

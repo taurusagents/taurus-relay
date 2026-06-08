@@ -86,6 +86,8 @@ type Session struct {
 	tty      bool
 	ptyFile  *os.File
 	outputWG sync.WaitGroup
+	stdinMu  sync.Mutex
+	stdinEOF bool
 
 	mu    sync.RWMutex
 	alive bool
@@ -104,8 +106,13 @@ func (s *Session) setAlive(v bool) {
 }
 
 func (s *Session) WriteStdin(data []byte) error {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
 	if s.stdin == nil {
 		return fmt.Errorf("stdin unavailable")
+	}
+	if s.stdinEOF {
+		return io.ErrClosedPipe
 	}
 	_, err := s.stdin.Write(data)
 	return err
@@ -119,10 +126,31 @@ func (s *Session) WriteStdinBase64(b64 string) error {
 	return s.WriteStdin(data)
 }
 
+// CloseStdin delivers EOF to a non-PTY proc session without forcing the whole
+// process tree to exit. PTY sessions do not have a separate stdin stream, so
+// callers must use terminal semantics there instead of proc stdin-close.
+func (s *Session) CloseStdin() error {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	if s.stdin == nil {
+		return fmt.Errorf("stdin unavailable")
+	}
+	if s.tty {
+		return fmt.Errorf("stdin EOF unsupported for PTY sessions")
+	}
+	if s.stdinEOF {
+		return nil
+	}
+	s.stdinEOF = true
+	return s.stdin.Close()
+}
+
 func (s *Session) Signal(signal string) error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return fmt.Errorf("session process unavailable")
 	}
+	// proc.signal preserves ChildProcess-style graceful control semantics by
+	// forwarding the requested signal to the session process group.
 	return signalProcessGroup(s.cmd.Process.Pid, parseSignal(signal))
 }
 
@@ -137,9 +165,14 @@ func (s *Session) Resize(cols, rows uint16) error {
 }
 
 func (s *Session) Kill() error {
+	// proc.kill is the dedicated hard-stop path. It is intentionally separate
+	// from proc.signal so Taurus can choose graceful signals vs unconditional kill.
+	s.stdinMu.Lock()
 	if s.stdin != nil {
+		s.stdinEOF = true
 		_ = s.stdin.Close()
 	}
+	s.stdinMu.Unlock()
 	if s.ptyFile != nil {
 		_ = s.ptyFile.Close()
 	}
@@ -365,6 +398,14 @@ func (m *Multiplexer) Resize(sessionID string, cols, rows uint16) error {
 		return err
 	}
 	return sess.Resize(cols, rows)
+}
+
+func (m *Multiplexer) CloseStdin(sessionID string) error {
+	sess, err := m.Get(sessionID)
+	if err != nil {
+		return err
+	}
+	return sess.CloseStdin()
 }
 
 func (m *Multiplexer) Signal(sessionID, signal string) error {

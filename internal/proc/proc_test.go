@@ -3,6 +3,7 @@ package proc
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -370,6 +371,74 @@ func TestCheckAliveTracksSessionLifecycle(t *testing.T) {
 	})
 }
 
+func TestMultiplexerCloseStdinDeliversEOF(t *testing.T) {
+	var mu sync.Mutex
+	var stdout strings.Builder
+	var stderr strings.Builder
+	exitCode := -1
+	mux := NewMultiplexer(
+		func(sessionID, stream string, data []byte, priority string) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch stream {
+			case "stdout":
+				stdout.Write(data)
+			case "stderr":
+				stderr.Write(data)
+			}
+		},
+		func(sessionID string, code int, priority string) {
+			mu.Lock()
+			exitCode = code
+			mu.Unlock()
+		},
+	)
+
+	if err := mux.Spawn("stdin-eof", []string{"bash", "-lc", "cat; printf eof >&2"}, "", nil, false, 0, 0, PriorityNormal); err != nil {
+		t.Fatalf("Spawn returned error: %v", err)
+	}
+	sess, err := mux.Get("stdin-eof")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if err := sess.WriteStdin([]byte("hello")); err != nil {
+		t.Fatalf("WriteStdin returned error: %v", err)
+	}
+	if err := mux.CloseStdin("stdin-eof"); err != nil {
+		t.Fatalf("CloseStdin returned error: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool {
+		return mux.Count() == 0
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if stdout.String() != "hello" {
+		t.Fatalf("expected stdout %q after EOF, got %q", "hello", stdout.String())
+	}
+	if stderr.String() != "eof" {
+		t.Fatalf("expected stderr %q after EOF, got %q", "eof", stderr.String())
+	}
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0 after stdin EOF, got %d", exitCode)
+	}
+	if err := sess.WriteStdin([]byte("again")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("expected closed-pipe error after EOF, got %v", err)
+	}
+}
+
+func TestMultiplexerCloseStdinRejectsPTYSessions(t *testing.T) {
+	mux := NewMultiplexer(nil, nil)
+	if err := mux.Spawn("stdin-eof-pty", []string{"bash", "-lc", "sleep 10"}, "", nil, true, 80, 24, PriorityNormal); err != nil {
+		t.Fatalf("Spawn returned error: %v", err)
+	}
+	defer mux.KillAll()
+	if err := mux.CloseStdin("stdin-eof-pty"); err == nil || !strings.Contains(err.Error(), "PTY") {
+		t.Fatalf("expected PTY stdin EOF to be rejected, got %v", err)
+	}
+}
+
 func TestMultiplexerSignalTargetsProcessGroup(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	mux := NewMultiplexer(nil, nil)
@@ -394,6 +463,74 @@ func TestMultiplexerSignalTargetsProcessGroup(t *testing.T) {
 	})
 	waitFor(t, time.Second, func() bool {
 		return !pidAlive(pid)
+	})
+}
+
+func TestMultiplexerSignalVsKillSemantics(t *testing.T) {
+	t.Run("signal preserves graceful trap handling", func(t *testing.T) {
+		termFile := filepath.Join(t.TempDir(), "term.txt")
+		readyFile := filepath.Join(t.TempDir(), "ready.txt")
+		mux := NewMultiplexer(nil, nil)
+		argv := []string{"python3", "-c", "import os, pathlib, signal, sys, time\npath = pathlib.Path(os.environ['TERMFILE'])\nready = pathlib.Path(os.environ['READYFILE'])\ndef on_term(signum, frame):\n    path.write_text('term')\n    raise SystemExit(0)\nsignal.signal(signal.SIGTERM, on_term)\nready.write_text('ready')\ntime.sleep(10)"}
+		if err := mux.Spawn(
+			"signal-graceful",
+			argv,
+			"",
+			map[string]string{"TERMFILE": termFile, "READYFILE": readyFile},
+			false,
+			0,
+			0,
+			PriorityNormal,
+		); err != nil {
+			t.Fatalf("Spawn returned error: %v", err)
+		}
+		waitFor(t, time.Second, func() bool {
+			_, err := os.Stat(readyFile)
+			return err == nil
+		})
+		if err := mux.Signal("signal-graceful", "TERM"); err != nil {
+			t.Fatalf("Signal returned error: %v", err)
+		}
+		waitFor(t, time.Second, func() bool {
+			return mux.Count() == 0
+		})
+		if data, err := os.ReadFile(termFile); err != nil {
+			t.Fatalf("expected TERM trap file after proc.signal, got err=%v", err)
+		} else if strings.TrimSpace(string(data)) != "term" {
+			t.Fatalf("unexpected TERM trap file contents after proc.signal: %q", string(data))
+		}
+	})
+
+	t.Run("kill stays hard and bypasses TERM trap", func(t *testing.T) {
+		termFile := filepath.Join(t.TempDir(), "term.txt")
+		readyFile := filepath.Join(t.TempDir(), "ready.txt")
+		mux := NewMultiplexer(nil, nil)
+		argv := []string{"python3", "-c", "import os, pathlib, signal, sys, time\npath = pathlib.Path(os.environ['TERMFILE'])\nready = pathlib.Path(os.environ['READYFILE'])\ndef on_term(signum, frame):\n    path.write_text('term')\n    raise SystemExit(0)\nsignal.signal(signal.SIGTERM, on_term)\nready.write_text('ready')\ntime.sleep(10)"}
+		if err := mux.Spawn(
+			"kill-hard",
+			argv,
+			"",
+			map[string]string{"TERMFILE": termFile, "READYFILE": readyFile},
+			false,
+			0,
+			0,
+			PriorityNormal,
+		); err != nil {
+			t.Fatalf("Spawn returned error: %v", err)
+		}
+		waitFor(t, time.Second, func() bool {
+			_, err := os.Stat(readyFile)
+			return err == nil
+		})
+		if err := mux.Kill("kill-hard"); err != nil {
+			t.Fatalf("Kill returned error: %v", err)
+		}
+		waitFor(t, time.Second, func() bool {
+			return mux.Count() == 0
+		})
+		if _, err := os.Stat(termFile); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected proc.kill not to run TERM trap, stat err=%v", err)
+		}
 	})
 }
 

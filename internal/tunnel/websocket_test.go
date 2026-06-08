@@ -633,6 +633,65 @@ func TestProcExitIsQueuedAfterFinalOutput(t *testing.T) {
 	}
 }
 
+func TestHandleProcStdinEOFClosesSession(t *testing.T) {
+	tun := NewNode("https://example.com", NodeOptions{DataPath: t.TempDir()})
+	generation := tun.currentRuntimeGeneration()
+	if err := tun.procs.Spawn("stdin-eof", []string{"bash", "-lc", "cat"}, "", nil, false, 0, 0, protocol.PriorityNormal); err != nil {
+		t.Fatalf("spawn proc session: %v", err)
+	}
+
+	payload, err := json.Marshal(protocol.ProcStdinPayload{
+		SessionID: "stdin-eof",
+		Data:      base64.StdEncoding.EncodeToString([]byte("hello")),
+		EOF:       true,
+	})
+	if err != nil {
+		t.Fatalf("marshal stdin payload: %v", err)
+	}
+	resp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcStdin, Payload: payload, Generation: generation})
+	if resp == nil || resp.Type != protocol.TypeProcStdinResult || resp.Error != nil {
+		t.Fatalf("expected successful proc.stdin.result response, got %#v", resp)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		return tun.procs.Count() == 0
+	})
+
+	first, ok := tun.tryDequeueNextMessage(0)
+	if !ok {
+		t.Fatalf("expected queued proc.output message after stdin EOF")
+	}
+	if first.Type != protocol.TypeProcOutput {
+		t.Fatalf("expected proc.output before proc.exit after stdin EOF, got %s", first.Type)
+	}
+	var output protocol.ProcOutputPayload
+	if err := json.Unmarshal(first.Payload, &output); err != nil {
+		t.Fatalf("unmarshal proc.output payload: %v", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(output.Data)
+	if err != nil {
+		t.Fatalf("decode proc.output data: %v", err)
+	}
+	if string(decoded) != "hello" {
+		t.Fatalf("expected proc.output payload %q after stdin EOF, got %q", "hello", string(decoded))
+	}
+
+	second, ok := tun.tryDequeueNextMessage(0)
+	if !ok {
+		t.Fatalf("expected queued proc.exit message after stdin EOF")
+	}
+	if second.Type != protocol.TypeProcExit {
+		t.Fatalf("expected proc.exit after proc.output after stdin EOF, got %s", second.Type)
+	}
+	var exit protocol.ProcExitPayload
+	if err := json.Unmarshal(second.Payload, &exit); err != nil {
+		t.Fatalf("unmarshal proc.exit payload: %v", err)
+	}
+	if exit.ExitCode != 0 {
+		t.Fatalf("expected exit code 0 after stdin EOF, got %d", exit.ExitCode)
+	}
+}
+
 func TestHandleProcSpawnRejectsSessionReuseWhileOldOutputIsStillQueued(t *testing.T) {
 	tun := NewNode("https://example.com", NodeOptions{DataPath: t.TempDir()})
 	generation := tun.currentRuntimeGeneration()
