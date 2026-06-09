@@ -25,7 +25,7 @@ It connects remote machines to a Taurus control plane over WebSocket and support
 ## Requirements
 
 - Go 1.22+
-- For **node** mode:
+- For **node** mode on Linux hosts:
   - Taurus is expected to drive any host tooling it needs (for example Docker) through generic `proc.*`
 
 ## Build
@@ -78,6 +78,8 @@ curl -fsSL https://get.taurus.cloud/relay | TAURUS_TOKEN=<registration-token> TA
 $env:TAURUS_TOKEN='<registration-token>'; $env:TAURUS_URL='https://app.taurus.cloud'; $installer = Join-Path $env:TEMP 'install-taurus-relay.ps1'; Invoke-WebRequest https://get.taurus.cloud/relay.ps1 -OutFile $installer; powershell -ExecutionPolicy Bypass -File $installer
 ```
 
+Windows release artifacts are supported for install and `connect` mode. `node` mode is not supported on Windows.
+
 For self-hosted Taurus, replace `TAURUS_URL` with your public Taurus app URL.
 
 ## Usage
@@ -107,7 +109,9 @@ Subsequent reconnects reuse saved credentials:
 ./taurus-relay connect --server https://your-taurus-host.example
 ```
 
-### Node mode
+### Node mode (Linux hosts)
+
+`node` mode is supported on Linux hosts. Windows releases are connect-only, and `taurus-relay node` exits immediately with an explicit unsupported error on Windows.
 
 ```bash
 ./taurus-relay node \
@@ -181,8 +185,8 @@ GoReleaser (`.goreleaser.yaml`) builds `taurus-relay` for:
 Current support notes:
 
 - **Linux**: fully supported for both `connect` and `node` mode.
-- **macOS**: supported for `connect`; `node` mode is not a normal deployment target because it depends on Docker-based Taurus container hosting on Linux.
-- **Windows**: release binaries are built and published, but interactive `connect` sessions may require an explicit shell (for example `powershell.exe`) instead of assuming `bash`. The current Taurus control plane commonly requests `bash` for relay shell sessions, so native Windows `connect` support should still be treated as provisional until the control plane can request a Windows-appropriate shell. `node` mode should also be treated as experimental unless/until it is validated end-to-end on native Windows hosts.
+- **macOS**: supported for `connect`; `node` mode is not supported because Taurus container hosting depends on Linux Docker semantics.
+- **Windows**: release binaries are built and published, and Windows is supported for install plus `connect` mode. Interactive shell sessions may require the Taurus control plane to request a Windows-appropriate shell (for example `powershell.exe`) instead of assuming `bash`. `node` mode is explicitly unsupported on Windows; Windows releases are connect-only.
 - The public installers depend on the archive naming above staying stable as `taurus-relay_<version>_<os>_<arch>.(tar.gz|zip)` plus `checksums.txt`; `.goreleaser.yaml` now pins that explicitly.
 
 ### How to cut a release

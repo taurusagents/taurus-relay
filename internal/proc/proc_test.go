@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -45,11 +44,6 @@ func waitForPIDFile(t *testing.T, path string) int {
 		return pid > 0
 	})
 	return pid
-}
-
-func pidAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
 }
 
 func TestRunSplitsStdoutAndStderr(t *testing.T) {

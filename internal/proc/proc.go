@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -192,7 +191,7 @@ func (s *Session) Kill() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
-	return signalProcessGroup(s.cmd.Process.Pid, syscall.SIGKILL)
+	return hardKillProcess(s.cmd.Process.Pid)
 }
 
 // Multiplexer tracks spawned proc sessions and dispatches their stream events.
@@ -514,16 +513,6 @@ func upsertEnv(env []string, key, value string) []string {
 	return append(env, prefix+value)
 }
 
-func configureCommandProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil {
-		return
-	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
-}
-
 func runWithContext(ctx context.Context, cmd *exec.Cmd) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -542,7 +531,7 @@ func runWithContext(ctx context.Context, cmd *exec.Cmd) error {
 		return err
 	case <-ctx.Done():
 		if cmd.Process != nil {
-			_ = signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+			_ = hardKillProcess(cmd.Process.Pid)
 		}
 		<-waitCh
 		return ctx.Err()
@@ -589,34 +578,4 @@ func waitForExit(cmd *exec.Cmd) (int, error) {
 		}
 	}
 	return exitCode, err
-}
-
-func signalProcessGroup(pid int, sig syscall.Signal) error {
-	if pid <= 0 {
-		return nil
-	}
-	if err := syscall.Kill(-pid, sig); err != nil {
-		if err == syscall.ESRCH {
-			if directErr := syscall.Kill(pid, sig); directErr == nil || directErr == syscall.ESRCH {
-				return nil
-			} else {
-				return directErr
-			}
-		}
-		return err
-	}
-	return nil
-}
-
-func parseSignal(signal string) (syscall.Signal, error) {
-	switch strings.ToUpper(strings.TrimSpace(signal)) {
-	case "SIGINT", "INT":
-		return syscall.SIGINT, nil
-	case "SIGTERM", "TERM":
-		return syscall.SIGTERM, nil
-	case "SIGKILL", "KILL":
-		return syscall.SIGKILL, nil
-	default:
-		return 0, fmt.Errorf("unknown signal: %s", signal)
-	}
 }

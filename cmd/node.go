@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -15,6 +16,9 @@ import (
 )
 
 func Node(server, name, host, token, dataPath string, maxContainers int, insecure bool) error {
+	if err := validateNodePlatform(runtime.GOOS); err != nil {
+		return err
+	}
 	if server == "" {
 		return fmt.Errorf("--server is required")
 	}
@@ -70,6 +74,13 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 	}()
 
 	return tun.Run()
+}
+
+func validateNodePlatform(goos string) error {
+	if goos == "windows" {
+		return fmt.Errorf("taurus-relay node is not supported on Windows; Windows releases support connect mode only")
+	}
+	return nil
 }
 
 func canonicalizeNodeDataPath(dataPath string) (string, error) {

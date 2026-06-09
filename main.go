@@ -69,7 +69,7 @@ func printUsage() {
 
 Commands:
   connect    Connect to a Taurus daemon as a user relay
-  node       Connect to a Taurus daemon as a container node relay
+  node       Connect to a Taurus daemon as a container node relay (Linux hosts only)
   status     Show relay status and saved credentials
   version    Print version information
   help       Show this help
@@ -87,6 +87,8 @@ Node options:
   --data-path <path>       Data root (default: /data/taurus)
   --max-containers <n>     Container cap (default: 0 = unlimited)
   --insecure               Allow non-TLS (ws://) connections
+
+  Note: Windows releases support connect mode only; node mode is unsupported on Windows.
 
 Examples:
   taurus-relay connect --token abc123 --server https://taurus.example.com
