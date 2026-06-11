@@ -49,6 +49,19 @@ func waitForPIDFile(t *testing.T, path string) int {
 	return pid
 }
 
+func assertResponseTypeNoError(t *testing.T, resp *protocol.Message, wantType string) {
+	t.Helper()
+	if resp == nil {
+		t.Fatalf("expected %s response", wantType)
+	}
+	if resp.Type != wantType {
+		t.Fatalf("expected response type %s, got %s", wantType, resp.Type)
+	}
+	if resp.Error != nil {
+		t.Fatalf("expected %s success response, got error %q", wantType, *resp.Error)
+	}
+}
+
 func beginBlockedRuntimeReset(t *testing.T, tun *Tunnel) chan struct{} {
 	t.Helper()
 	startGeneration := tun.currentRuntimeGeneration()
@@ -703,6 +716,89 @@ func TestHandleShellCreateQueuesExitAfterOutputAndRejectsReuseUntilDrain(t *test
 	}
 	waitForCondition(t, time.Second, func() bool {
 		return tun.shells.Count() == 0
+	})
+}
+
+func TestConnectModeRegistersProcHandlersForAutomationShells(t *testing.T) {
+	tun := New(&config.Config{Server: "https://example.com"}, "")
+	generation := tun.currentRuntimeGeneration()
+
+	runPayload, err := json.Marshal(protocol.ProcRunPayload{Argv: []string{"bash", "-lc", "printf run-ok"}})
+	if err != nil {
+		t.Fatalf("marshal proc.run payload: %v", err)
+	}
+	runResp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcRun, Payload: runPayload, Generation: generation})
+	assertResponseTypeNoError(t, runResp, protocol.TypeProcRunResult)
+	var runResult protocol.ProcRunResultPayload
+	if err := json.Unmarshal(runResp.Payload, &runResult); err != nil {
+		t.Fatalf("unmarshal proc.run payload: %v", err)
+	}
+	if runResult.Stdout != "run-ok" {
+		t.Fatalf("expected connect-mode proc.run stdout %q, got %q", "run-ok", runResult.Stdout)
+	}
+
+	spawnPayload, err := json.Marshal(protocol.ProcSpawnPayload{
+		SessionID: "connect-proc",
+		Argv:      []string{"bash", "-lc", "cat"},
+	})
+	if err != nil {
+		t.Fatalf("marshal proc.spawn payload: %v", err)
+	}
+	spawnResp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcSpawn, Payload: spawnPayload, Generation: generation})
+	assertResponseTypeNoError(t, spawnResp, protocol.TypeProcSpawnResult)
+	var spawnResult map[string]string
+	if err := json.Unmarshal(spawnResp.Payload, &spawnResult); err != nil {
+		t.Fatalf("unmarshal proc.spawn payload: %v", err)
+	}
+	if spawnResult["status"] != "started" || spawnResult["session_id"] != "connect-proc" {
+		t.Fatalf("unexpected connect-mode proc.spawn result: %v", spawnResult)
+	}
+
+	stdinPayload, err := json.Marshal(protocol.ProcStdinPayload{
+		SessionID: "connect-proc",
+		Data:      base64.StdEncoding.EncodeToString([]byte("hello")),
+		EOF:       true,
+	})
+	if err != nil {
+		t.Fatalf("marshal proc.stdin payload: %v", err)
+	}
+	stdinResp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcStdin, Payload: stdinPayload, Generation: generation})
+	assertResponseTypeNoError(t, stdinResp, protocol.TypeProcStdinResult)
+	waitForCondition(t, time.Second, func() bool {
+		return !tun.procs.CheckAlive("connect-proc")
+	})
+	first, ok := tun.tryDequeueNextMessage(0)
+	if !ok {
+		t.Fatalf("expected queued proc.output from connect-mode proc.spawn session")
+	}
+	if first.Type != protocol.TypeProcOutput {
+		t.Fatalf("expected proc.output after connect-mode proc.stdin EOF, got %s", first.Type)
+	}
+
+	if err := tun.procs.Spawn("connect-signal", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, protocol.PriorityNormal); err != nil {
+		t.Fatalf("spawn signal session: %v", err)
+	}
+	signalPayload, err := json.Marshal(protocol.ProcSignalPayload{SessionID: "connect-signal", Signal: "TERM"})
+	if err != nil {
+		t.Fatalf("marshal proc.signal payload: %v", err)
+	}
+	signalResp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcSignal, Payload: signalPayload, Generation: generation})
+	assertResponseTypeNoError(t, signalResp, protocol.TypeProcSignalResult)
+	waitForCondition(t, time.Second, func() bool {
+		return !tun.procs.CheckAlive("connect-signal")
+	})
+
+	if err := tun.procs.Spawn("connect-kill", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, protocol.PriorityNormal); err != nil {
+		t.Fatalf("spawn kill session: %v", err)
+	}
+	killPayload, err := json.Marshal(protocol.ProcKillPayload{SessionID: "connect-kill"})
+	if err != nil {
+		t.Fatalf("marshal proc.kill payload: %v", err)
+	}
+	killResp := tun.handler.Handle(&protocol.Message{Type: protocol.TypeProcKill, Payload: killPayload, Generation: generation})
+	assertResponseTypeNoError(t, killResp, protocol.TypeProcKillResult)
+	waitForCondition(t, time.Second, func() bool {
+		return !tun.procs.CheckAlive("connect-kill")
 	})
 }
 

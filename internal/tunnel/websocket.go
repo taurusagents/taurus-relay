@@ -372,10 +372,9 @@ func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
 				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceShell, sessionID, protocol.PriorityNormal, &protocol.Message{Type: protocol.TypeShellExit, Payload: payload}, len(payload))
 			},
 		)
-		return
 	}
 
-	if t.mode == ModeNode && t.node != nil {
+	if t.mode == ModeConnect || (t.mode == ModeNode && t.node != nil) {
 		t.procs = proc.NewMultiplexer(
 			func(sessionID, stream string, data []byte, priority string) {
 				payload, _ := json.Marshal(protocol.ProcOutputPayload{
@@ -408,6 +407,15 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeShellWriteStdin, t.handleShellWriteStdin)
 		h.Register(protocol.TypeShellResize, t.handleShellResize)
 		h.Register(protocol.TypeShellSignal, t.handleShellSignal)
+		// Connect-mode relays already grant arbitrary shell execution to authorized
+		// Taurus users. Expose the matching non-PTY proc primitives so automation
+		// shells can avoid PTY pager/TUI contamination without widening beyond the
+		// minimal process-control surface Taurus needs.
+		h.Register(protocol.TypeProcRun, t.handleProcRun)
+		h.Register(protocol.TypeProcSpawn, t.handleProcSpawn)
+		h.Register(protocol.TypeProcStdin, t.handleProcStdin)
+		h.Register(protocol.TypeProcSignal, t.handleProcSignal)
+		h.Register(protocol.TypeProcKill, t.handleProcKill)
 	}
 
 	if mode == ModeNode {
