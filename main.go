@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/taurusagents/taurus-relay/cmd"
+	"github.com/taurusagents/taurus-relay/internal/config"
 )
 
 func main() {
@@ -22,7 +23,9 @@ func main() {
 		server := connectCmd.String("server", "", "Taurus daemon URL (e.g., https://taurus.example.com)")
 		token := connectCmd.String("token", "", "One-time registration token")
 		insecure := connectCmd.Bool("insecure", false, "Allow non-TLS (ws://) connections (for local development)")
+		configDir := connectCmd.String("config-dir", "", "Directory containing config.json (default: ~/.config/taurus-relay, or $TAURUS_RELAY_CONFIG_DIR)")
 		connectCmd.Parse(os.Args[2:])
+		config.SetDir(*configDir)
 
 		if err := cmd.Connect(*server, *token, *insecure); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -46,6 +49,11 @@ func main() {
 		}
 
 	case "status":
+		statusCmd := flag.NewFlagSet("status", flag.ExitOnError)
+		configDir := statusCmd.String("config-dir", "", "Directory containing config.json (default: ~/.config/taurus-relay, or $TAURUS_RELAY_CONFIG_DIR)")
+		statusCmd.Parse(os.Args[2:])
+		config.SetDir(*configDir)
+
 		if err := cmd.Status(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -78,6 +86,8 @@ Connect options:
   --server <url>    Taurus daemon URL (e.g., https://taurus.example.com)
   --token <token>   One-time registration token (required for first connection)
   --insecure        Allow non-TLS (ws://) connections (for local development)
+  --config-dir <dir>  Directory containing config.json (default: ~/.config/taurus-relay,
+                      or the TAURUS_RELAY_CONFIG_DIR environment variable)
 
 Node options:
   --server <url>           Taurus control plane URL (required)
@@ -90,10 +100,14 @@ Node options:
 
   Note: Windows releases support connect mode only; node mode is unsupported on Windows.
 
+Status options:
+  --config-dir <dir>  Directory containing config.json (same as connect)
+
 Examples:
   taurus-relay connect --token abc123 --server https://taurus.example.com
   taurus-relay connect --server https://taurus.example.com  # uses saved credentials
   taurus-relay connect --insecure --server http://localhost:3000  # local dev
+  taurus-relay connect --config-dir ~/relay-work --server https://taurus.example.com  # separate identity
   taurus-relay node --server https://your-taurus-host.example --name hetzner-1 --host 203.0.113.10 --token <node-enrollment-token>
   taurus-relay status
 `)

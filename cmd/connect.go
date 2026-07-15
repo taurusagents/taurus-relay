@@ -53,6 +53,9 @@ func Connect(server, token string, insecure bool) error {
 	}
 
 	fmt.Printf("Taurus Relay %s\n", health.Version)
+	// Print the effective config path so users running multiple identities
+	// (via --config-dir / TAURUS_RELAY_CONFIG_DIR) can tell which one this is.
+	fmt.Printf("Config:    %s\n", config.Path())
 	fmt.Printf("Connecting to %s...\n", cfg.Server)
 
 	tun := tunnel.New(cfg, token)

@@ -8,8 +8,39 @@ import (
 	"path/filepath"
 )
 
-const configDir = ".config/taurus-relay"
+// defaultConfigDir is the config directory relative to the user's home,
+// used when no override is provided.
+const defaultConfigDir = ".config/taurus-relay"
 const configFile = "config.json"
+
+// EnvConfigDir is the environment variable that overrides the config directory.
+const EnvConfigDir = "TAURUS_RELAY_CONFIG_DIR"
+
+// overrideDir is set from the --config-dir CLI flag and takes precedence
+// over both the environment variable and the default location.
+var overrideDir string
+
+// SetDir sets an explicit config directory (e.g. from --config-dir).
+// An empty string clears the override.
+func SetDir(dir string) {
+	overrideDir = dir
+}
+
+// Dir resolves the config directory: --config-dir flag > TAURUS_RELAY_CONFIG_DIR
+// env var > ~/.config/taurus-relay.
+func Dir() string {
+	if overrideDir != "" {
+		return overrideDir
+	}
+	if env := os.Getenv(EnvConfigDir); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, defaultConfigDir)
+}
 
 // Config holds persistent relay credentials and settings.
 type Config struct {
@@ -21,11 +52,7 @@ type Config struct {
 
 // Path returns the full config file path.
 func Path() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = "."
-	}
-	return filepath.Join(home, configDir, configFile)
+	return filepath.Join(Dir(), configFile)
 }
 
 // Load reads config from disk. Returns zero Config if file doesn't exist.

@@ -109,6 +109,20 @@ Subsequent reconnects reuse saved credentials:
 ./taurus-relay connect --server https://your-taurus-host.example
 ```
 
+Credentials are stored in `~/.config/taurus-relay/config.json`. To store them
+somewhere else — for example to run two relay identities from one OS account —
+point the relay at a different config directory with `--config-dir` (or the
+`TAURUS_RELAY_CONFIG_DIR` environment variable; the flag wins if both are set):
+
+```bash
+./taurus-relay connect --config-dir ~/relay-alt \
+  --server https://your-taurus-host.example \
+  --token <registration-token>
+```
+
+The directory always contains a file named `config.json`. `taurus-relay status`
+accepts the same `--config-dir` flag.
+
 ### Node mode (Linux hosts)
 
 `node` mode is supported on Linux hosts. Windows releases are connect-only, and `taurus-relay node` exits immediately with an explicit unsupported error on Windows.
