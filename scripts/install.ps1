@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repo = if ($env:TAURUS_RELAY_REPO) { $env:TAURUS_RELAY_REPO } else { 'taurusagents/taurus-relay' }
-$taurusUrl = if ($env:TAURUS_URL) { $env:TAURUS_URL.TrimEnd('/') } else { 'https://app.taurus.cloud' }
+$taurusUrl = if ($env:TAURUS_URL) { $env:TAURUS_URL.TrimEnd('/') } else { 'https://app.taurusagents.com' }
 $version = if ($env:TAURUS_RELAY_VERSION) { $env:TAURUS_RELAY_VERSION } else { 'latest' }
 $skipConnect = $env:TAURUS_RELAY_SKIP_CONNECT -eq '1'
 $installDir = if ($env:TAURUS_INSTALL_DIR) {

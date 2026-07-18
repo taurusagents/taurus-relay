@@ -44,21 +44,21 @@ go install github.com/taurusagents/taurus-relay@latest
 
 These are the public bootstrap scripts intended to be served at:
 
-- `https://get.taurus.cloud/relay` → `scripts/install.sh`
-- `https://get.taurus.cloud/relay.ps1` → `scripts/install.ps1`
+- `https://get.taurusagents.com/relay` → `scripts/install.sh`
+- `https://get.taurusagents.com/relay.ps1` → `scripts/install.ps1`
 
 Both installers download the latest GitHub release artifact for the current platform,
 verify it against `checksums.txt`, install the binary locally, and then run
 `taurus-relay connect`.
 
 Because they use GitHub's stable `releases/latest/download/...` URLs, cut a fresh
-relay release after merging these installer changes before wiring `get.taurus.cloud`
+relay release after merging these installer changes before wiring `get.taurusagents.com`
 to them in production.
 
 ### Environment variables
 
 - `TAURUS_TOKEN` — one-time registration token from the Taurus UI
-- `TAURUS_URL` — Taurus app/control-plane base URL (defaults to `https://app.taurus.cloud`)
+- `TAURUS_URL` — Taurus app/control-plane base URL (defaults to `https://app.taurusagents.com`)
 
 Optional advanced overrides:
 
@@ -69,13 +69,13 @@ Optional advanced overrides:
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://get.taurus.cloud/relay | TAURUS_TOKEN=<registration-token> TAURUS_URL=https://app.taurus.cloud sh
+curl -fsSL https://get.taurusagents.com/relay | TAURUS_TOKEN=<registration-token> TAURUS_URL=https://app.taurusagents.com sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-$env:TAURUS_TOKEN='<registration-token>'; $env:TAURUS_URL='https://app.taurus.cloud'; $installer = Join-Path $env:TEMP 'install-taurus-relay.ps1'; Invoke-WebRequest https://get.taurus.cloud/relay.ps1 -OutFile $installer; powershell -ExecutionPolicy Bypass -File $installer
+$env:TAURUS_TOKEN='<registration-token>'; $env:TAURUS_URL='https://app.taurusagents.com'; $installer = Join-Path $env:TEMP 'install-taurus-relay.ps1'; Invoke-WebRequest https://get.taurusagents.com/relay.ps1 -OutFile $installer; powershell -ExecutionPolicy Bypass -File $installer
 ```
 
 Windows release artifacts are supported for install and `connect` mode. `node` mode is not supported on Windows.
@@ -263,6 +263,6 @@ In the GitHub repository settings:
 
 This repository intentionally contains only the relay binary and its internal Go packages. It does **not** include the Taurus control plane / web app / daemon source code.
 
-Public install scripts live in [`scripts/install.sh`](./scripts/install.sh) and [`scripts/install.ps1`](./scripts/install.ps1). If you are wiring up `get.taurus.cloud`, serve or redirect `/relay` and `/relay.ps1` to those script contents.
+Public install scripts live in [`scripts/install.sh`](./scripts/install.sh) and [`scripts/install.ps1`](./scripts/install.ps1). If you are wiring up `get.taurusagents.com`, serve or redirect `/relay` and `/relay.ps1` to those script contents.
 
 No license has been added yet.
