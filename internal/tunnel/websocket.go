@@ -298,14 +298,16 @@ func procRunResultPayload(result *proc.RunResult, canceled bool) *protocol.ProcR
 		stderrText = result.Stderr
 	}
 	return &protocol.ProcRunResultPayload{
-		Stdout:       stdoutText,
-		StdoutBase64: base64.StdEncoding.EncodeToString([]byte(result.Stdout)),
-		Stderr:       stderrText,
-		StderrBase64: base64.StdEncoding.EncodeToString([]byte(result.Stderr)),
-		ExitCode:     result.ExitCode,
-		DurationMs:   result.Duration.Milliseconds(),
-		TimedOut:     result.TimedOut,
-		Canceled:     canceled,
+		Stdout:          stdoutText,
+		StdoutBase64:    base64.StdEncoding.EncodeToString([]byte(result.Stdout)),
+		Stderr:          stderrText,
+		StderrBase64:    base64.StdEncoding.EncodeToString([]byte(result.Stderr)),
+		ExitCode:        result.ExitCode,
+		DurationMs:      result.Duration.Milliseconds(),
+		TimedOut:        result.TimedOut,
+		Canceled:        canceled,
+		StdoutTruncated: result.StdoutTruncated,
+		StderrTruncated: result.StderrTruncated,
 	}
 }
 

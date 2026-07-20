@@ -259,6 +259,133 @@ func TestRunCapsCapturedOutput(t *testing.T) {
 	if result.Stderr != strings.Repeat("y", 64) {
 		t.Fatalf("expected stderr capture to keep the first bytes, got %q", result.Stderr)
 	}
+	if !result.StdoutTruncated {
+		t.Fatalf("expected stdout truncation to be reported")
+	}
+	if !result.StderrTruncated {
+		t.Fatalf("expected stderr truncation to be reported")
+	}
+}
+
+func TestRunReportsNoTruncationForCompleteCapture(t *testing.T) {
+	result, err := Run(
+		context.Background(),
+		[]string{"bash", "-lc", "echo out; echo err >&2"},
+		"",
+		nil,
+		nil,
+		5000,
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		t.Fatalf("expected no truncation for small output, got stdout=%t stderr=%t", result.StdoutTruncated, result.StderrTruncated)
+	}
+}
+
+func TestRunReportsTruncationOnTimeoutPartialOutput(t *testing.T) {
+	originalLimit := maxRunCaptureBytes
+	maxRunCaptureBytes = 8
+	t.Cleanup(func() {
+		maxRunCaptureBytes = originalLimit
+	})
+
+	// The command overflows the capture limit and then blocks until the run
+	// times out, so the partial result comes back via the error/timeout path.
+	result, err := Run(
+		context.Background(),
+		[]string{"bash", "-lc", "printf '0123456789abcdef'; sleep 10"},
+		"",
+		nil,
+		nil,
+		300,
+	)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !result.TimedOut {
+		t.Fatalf("expected the run to report a timeout")
+	}
+	if result.Stdout != "01234567" {
+		t.Fatalf("expected capped partial stdout, got %q", result.Stdout)
+	}
+	if !result.StdoutTruncated {
+		t.Fatalf("expected stdout truncation to be reported on the timeout path")
+	}
+	if result.StderrTruncated {
+		t.Fatalf("expected no stderr truncation for an empty stderr stream")
+	}
+}
+
+func TestLimitedBufferTruncationTracking(t *testing.T) {
+	t.Run("exactly at limit is not truncated", func(t *testing.T) {
+		b := &limitedBuffer{limit: 4}
+		if _, err := b.Write([]byte("abcd")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if b.Truncated() {
+			t.Fatalf("byte-exact capture must not report truncation")
+		}
+		if b.String() != "abcd" {
+			t.Fatalf("unexpected captured bytes %q", b.String())
+		}
+	})
+
+	t.Run("overflowing write marks truncated", func(t *testing.T) {
+		b := &limitedBuffer{limit: 4}
+		if _, err := b.Write([]byte("abcdef")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if !b.Truncated() {
+			t.Fatalf("expected truncation flag after dropping bytes")
+		}
+		if b.String() != "abcd" {
+			t.Fatalf("unexpected captured bytes %q", b.String())
+		}
+	})
+
+	t.Run("write after full buffer marks truncated", func(t *testing.T) {
+		b := &limitedBuffer{limit: 2}
+		if _, err := b.Write([]byte("ab")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if b.Truncated() {
+			t.Fatalf("no truncation expected while at limit")
+		}
+		if _, err := b.Write([]byte("c")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if !b.Truncated() {
+			t.Fatalf("expected truncation flag once extra bytes were dropped")
+		}
+	})
+
+	t.Run("empty write never marks truncated", func(t *testing.T) {
+		b := &limitedBuffer{limit: 1}
+		if _, err := b.Write([]byte("a")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := b.Write(nil); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if b.Truncated() {
+			t.Fatalf("zero-length write dropped nothing, must not report truncation")
+		}
+	})
+
+	t.Run("non-positive limit captures nothing and reports truncation", func(t *testing.T) {
+		b := &limitedBuffer{limit: 0}
+		if _, err := b.Write([]byte("a")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if b.String() != "" {
+			t.Fatalf("limit<=0 must capture nothing, got %q", b.String())
+		}
+		if !b.Truncated() {
+			t.Fatalf("dropping all bytes must report truncation")
+		}
+	})
 }
 
 func TestMultiplexerSpawnNonPTYSeparatesStreams(t *testing.T) {
@@ -266,6 +393,7 @@ func TestMultiplexerSpawnNonPTYSeparatesStreams(t *testing.T) {
 	var stdout strings.Builder
 	var stderr strings.Builder
 	var exitCode int
+	var exited bool
 	mux := NewMultiplexer(
 		func(sessionID, stream string, data []byte, priority string) {
 			mu.Lock()
@@ -280,6 +408,7 @@ func TestMultiplexerSpawnNonPTYSeparatesStreams(t *testing.T) {
 		func(sessionID string, code int, priority string) {
 			mu.Lock()
 			exitCode = code
+			exited = true
 			mu.Unlock()
 		},
 	)
@@ -288,8 +417,13 @@ func TestMultiplexerSpawnNonPTYSeparatesStreams(t *testing.T) {
 		t.Fatalf("Spawn returned error: %v", err)
 	}
 
+	// Wait for the exit callback, not CheckAlive: the session is marked dead
+	// before its output goroutines finish draining, so CheckAlive can flip
+	// false while stdout/stderr callbacks are still pending.
 	waitFor(t, time.Second, func() bool {
-		return !mux.CheckAlive("s1")
+		mu.Lock()
+		defer mu.Unlock()
+		return exited
 	})
 
 	mu.Lock()

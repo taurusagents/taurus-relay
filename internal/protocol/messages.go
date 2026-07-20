@@ -108,6 +108,12 @@ type ProcRunResultPayload struct {
 	DurationMs   int64  `json:"duration_ms"`
 	TimedOut     bool   `json:"timed_out,omitempty"`
 	Canceled     bool   `json:"canceled,omitempty"`
+	// StdoutTruncated/StderrTruncated are set when the relay's capture limit
+	// dropped bytes from that stream, so consumers never have to guess from
+	// output size whether they received a cut-off prefix. Additive fields:
+	// older peers simply ignore them.
+	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool `json:"stderr_truncated,omitempty"`
 }
 
 type ProcCancelPayload struct {
