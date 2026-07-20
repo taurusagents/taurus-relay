@@ -1386,7 +1386,8 @@ func (t *Tunnel) handleProcSpawn(msg *protocol.Message) (string, any, error) {
 		return protocol.TypeProcSpawnResult, nil, fmt.Errorf("proc session %s still has queued output from the previous run", p.SessionID)
 	}
 	priority := protocol.NormalizePriority(msg.Priority)
-	log.Printf("[relay-node] rpc proc.spawn session=%s argv=%v pty=%t priority=%s", p.SessionID, p.Argv, p.Pty, priority)
+	// Never log raw spawn argv: -e/--env assignments carry real secrets.
+	log.Printf("[relay-node] rpc proc.spawn session=%s argv=%v pty=%t priority=%s", p.SessionID, redactEnvValuesInArgv(p.Argv), p.Pty, priority)
 	if err := procs.Spawn(p.SessionID, p.Argv, p.CWD, p.Env, p.Pty, p.Cols, p.Rows, priority); err != nil {
 		return protocol.TypeProcSpawnResult, nil, err
 	}
