@@ -108,6 +108,12 @@ type ProcRunResultPayload struct {
 	DurationMs   int64  `json:"duration_ms"`
 	TimedOut     bool   `json:"timed_out,omitempty"`
 	Canceled     bool   `json:"canceled,omitempty"`
+	// StdoutTruncated/StderrTruncated are set when the relay's capture limit
+	// dropped bytes from that stream, so consumers never have to guess from
+	// output size whether they received a cut-off prefix. Additive fields:
+	// older peers simply ignore them.
+	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool `json:"stderr_truncated,omitempty"`
 }
 
 type ProcCancelPayload struct {
@@ -236,15 +242,19 @@ type FileRemovePayload struct {
 // --- Node payloads ---
 
 type NodeRegisterPayload struct {
-	Type             string            `json:"type"`
-	Name             string            `json:"name"`
-	Host             string            `json:"host"`
-	EnrollmentToken  string            `json:"enrollment_token"`
-	AllocatableRAMGB float64           `json:"allocatable_ram_gb"`
-	AllocatableCPUs  int               `json:"allocatable_cpus"`
-	MaxContainers    int               `json:"max_containers,omitempty"`
-	Capabilities     map[string]bool   `json:"capabilities,omitempty"`
-	Meta             map[string]string `json:"meta,omitempty"`
+	Type             string  `json:"type"`
+	Name             string  `json:"name"`
+	Host             string  `json:"host"`
+	EnrollmentToken  string  `json:"enrollment_token"`
+	AllocatableRAMGB float64 `json:"allocatable_ram_gb"`
+	AllocatableCPUs  int     `json:"allocatable_cpus"`
+	MaxContainers    int     `json:"max_containers,omitempty"`
+	// MaxProcSessions advertises the relay's effective concurrent proc-session
+	// cap so the control plane does not have to hardcode it. Additive field:
+	// absent means the cap is unlimited or the relay predates this field.
+	MaxProcSessions int               `json:"max_proc_sessions,omitempty"`
+	Capabilities    map[string]bool   `json:"capabilities,omitempty"`
+	Meta            map[string]string `json:"meta,omitempty"`
 }
 
 type NodeRegisterResultPayload struct {

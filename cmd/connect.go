@@ -15,11 +15,16 @@ import (
 	"github.com/taurusagents/taurus-relay/internal/tunnel"
 )
 
-// Connect handles the `taurus-relay connect` command.
-func Connect(server, token string, insecure bool) error {
+// Connect handles the `taurus-relay connect` command. maxSessionsFlag is the
+// raw --max-sessions value (< 0 = flag not provided).
+func Connect(server, token string, insecure bool, maxSessionsFlag int) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	maxSessions, err := resolveMaxSessionsFromEnv(maxSessionsFlag, tunnel.DefaultConnectMaxSessions)
+	if err != nil {
+		return err
 	}
 
 	// Server from flag overrides saved config
@@ -58,7 +63,7 @@ func Connect(server, token string, insecure bool) error {
 	fmt.Printf("Config:    %s\n", config.Path())
 	fmt.Printf("Connecting to %s...\n", cfg.Server)
 
-	tun := tunnel.New(cfg, token)
+	tun := tunnel.New(cfg, token, maxSessions)
 
 	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/taurusagents/taurus-relay/internal/config"
+	"github.com/taurusagents/taurus-relay/internal/proc"
 	"github.com/taurusagents/taurus-relay/internal/protocol"
 )
 
@@ -628,7 +629,7 @@ func TestHandleProcSpawnRejectsSessionReuseWhileOldOutputIsStillQueued(t *testin
 }
 
 func TestResetRuntimeStateRejectsStaleShellCreate(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	oldShells := tun.shells
 	if oldShells == nil {
 		t.Fatalf("expected shell multiplexer to be initialized")
@@ -652,7 +653,7 @@ func TestResetRuntimeStateRejectsStaleShellCreate(t *testing.T) {
 }
 
 func TestResetRuntimeStateRetiresOldShellMuxBeforeKillAll(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	oldShells := tun.shells
 	if oldShells == nil {
 		t.Fatalf("expected shell multiplexer to be initialized")
@@ -671,7 +672,7 @@ func TestResetRuntimeStateRetiresOldShellMuxBeforeKillAll(t *testing.T) {
 }
 
 func TestHandleShellCreateQueuesExitAfterOutputAndRejectsReuseUntilDrain(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	generation := tun.currentRuntimeGeneration()
 	payload, err := json.Marshal(protocol.ShellCreatePayload{
 		SessionID: "reused-shell-session",
@@ -720,7 +721,7 @@ func TestHandleShellCreateQueuesExitAfterOutputAndRejectsReuseUntilDrain(t *test
 }
 
 func TestConnectModeRegistersProcHandlersForAutomationShells(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	generation := tun.currentRuntimeGeneration()
 
 	runPayload, err := json.Marshal(protocol.ProcRunPayload{Argv: []string{"bash", "-lc", "printf run-ok"}})
@@ -1288,5 +1289,32 @@ func TestHandleProcRunResultUsesBase64ForBinaryOutput(t *testing.T) {
 	}
 	if result.StderrBase64 != base64.StdEncoding.EncodeToString([]byte{0xff}) {
 		t.Fatalf("unexpected stderr_b64: %q", result.StderrBase64)
+	}
+}
+
+func TestProcRunResultPayloadCarriesTruncationFlags(t *testing.T) {
+	payload := procRunResultPayload(&proc.RunResult{
+		Stdout:          "partial",
+		StdoutTruncated: true,
+	}, false)
+	if !payload.StdoutTruncated {
+		t.Fatalf("expected stdout_truncated to be forwarded")
+	}
+	if payload.StderrTruncated {
+		t.Fatalf("expected stderr_truncated to stay false")
+	}
+
+	// The wire encoding must expose the flag under its documented additive
+	// field name and omit it entirely when false, so older daemons see an
+	// unchanged payload shape.
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if !strings.Contains(string(data), `"stdout_truncated":true`) {
+		t.Fatalf("expected stdout_truncated field on the wire, got %s", data)
+	}
+	if strings.Contains(string(data), "stderr_truncated") {
+		t.Fatalf("expected false stderr_truncated to be omitted, got %s", data)
 	}
 }

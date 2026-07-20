@@ -24,10 +24,17 @@ func main() {
 		token := connectCmd.String("token", "", "One-time registration token")
 		insecure := connectCmd.Bool("insecure", false, "Allow non-TLS (ws://) connections (for local development)")
 		configDir := connectCmd.String("config-dir", "", "Directory containing config.json (default: ~/.config/taurus-relay, or $TAURUS_RELAY_CONFIG_DIR)")
+		maxSessions := connectCmd.Int("max-sessions", cmd.MaxSessionsFlagUnset, "Max concurrent sessions, 0 = unlimited (default: 128, or $TAURUS_RELAY_MAX_SESSIONS)")
 		connectCmd.Parse(os.Args[2:])
 		config.SetDir(*configDir)
 
-		if err := cmd.Connect(*server, *token, *insecure); err != nil {
+		maxSessionsValue, err := cmd.ValidatedMaxSessionsFlag(connectCmd, "max-sessions", *maxSessions)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := cmd.Connect(*server, *token, *insecure, maxSessionsValue); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -41,9 +48,16 @@ func main() {
 		dataPath := nodeCmd.String("data-path", "/data/taurus", "Node data root path")
 		maxContainers := nodeCmd.Int("max-containers", 0, "Maximum containers allowed (0 = unlimited)")
 		insecure := nodeCmd.Bool("insecure", false, "Allow non-TLS (ws://) connections (for local development)")
+		maxSessions := nodeCmd.Int("max-sessions", cmd.MaxSessionsFlagUnset, "Max concurrent proc sessions, 0 = unlimited (default: 1048576, or $TAURUS_RELAY_MAX_SESSIONS)")
 		nodeCmd.Parse(os.Args[2:])
 
-		if err := cmd.Node(*server, *name, *host, *token, *dataPath, *maxContainers, *insecure); err != nil {
+		maxSessionsValue, err := cmd.ValidatedMaxSessionsFlag(nodeCmd, "max-sessions", *maxSessions)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := cmd.Node(*server, *name, *host, *token, *dataPath, *maxContainers, *insecure, maxSessionsValue); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -88,6 +102,8 @@ Connect options:
   --insecure        Allow non-TLS (ws://) connections (for local development)
   --config-dir <dir>  Directory containing config.json (default: ~/.config/taurus-relay,
                       or the TAURUS_RELAY_CONFIG_DIR environment variable)
+  --max-sessions <n>  Max concurrent sessions, 0 = unlimited (default: 128,
+                      or the TAURUS_RELAY_MAX_SESSIONS environment variable)
 
 Node options:
   --server <url>           Taurus control plane URL (required)
@@ -96,6 +112,8 @@ Node options:
   --token <token>          Enrollment token (required)
   --data-path <path>       Data root (default: /data/taurus)
   --max-containers <n>     Container cap (default: 0 = unlimited)
+  --max-sessions <n>       Max concurrent proc sessions, 0 = unlimited (default: 1048576,
+                           or the TAURUS_RELAY_MAX_SESSIONS environment variable)
   --insecure               Allow non-TLS (ws://) connections
 
   Note: Windows releases support connect mode only; node mode is unsupported on Windows.

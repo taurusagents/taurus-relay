@@ -16,7 +16,11 @@ import (
 )
 
 const (
-	DefaultMaxSessions = 50
+	// DefaultMaxSessions is the library-level fallback session cap applied by
+	// NewMultiplexer. The relay CLI normally overrides it per mode
+	// (--max-sessions / TAURUS_RELAY_MAX_SESSIONS); the cap is an adjustable
+	// operational ceiling, not a defense mechanism.
+	DefaultMaxSessions = 128
 	PriorityNormal     = "normal"
 	PriorityPriority   = "priority"
 	defaultExecPath    = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -59,30 +63,48 @@ type RunResult struct {
 	ExitCode int
 	Duration time.Duration
 	TimedOut bool
+	// StdoutTruncated/StderrTruncated report that the capture limit dropped
+	// bytes from the corresponding stream, so callers can distinguish a
+	// complete capture from a silently cut-off prefix.
+	StdoutTruncated bool
+	StderrTruncated bool
 }
 
+// limitedBuffer captures at most `limit` bytes and records whether any bytes
+// were dropped. A limit <= 0 captures nothing (it does NOT mean unlimited).
 type limitedBuffer struct {
-	limit int
-	buf   bytes.Buffer
+	limit     int
+	buf       bytes.Buffer
+	truncated bool
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
 	originalLen := len(p)
-	if b.limit <= 0 {
-		return originalLen, nil
+	remaining := 0
+	if b.limit > 0 {
+		remaining = b.limit - b.buf.Len()
 	}
-	remaining := b.limit - b.buf.Len()
 	if remaining > 0 {
-		if len(p) > remaining {
-			p = p[:remaining]
+		kept := p
+		if len(kept) > remaining {
+			kept = kept[:remaining]
 		}
-		_, _ = b.buf.Write(p)
+		_, _ = b.buf.Write(kept)
+		if len(kept) < originalLen {
+			b.truncated = true
+		}
+	} else if originalLen > 0 {
+		b.truncated = true
 	}
 	return originalLen, nil
 }
 
 func (b *limitedBuffer) String() string {
 	return b.buf.String()
+}
+
+func (b *limitedBuffer) Truncated() bool {
+	return b.truncated
 }
 
 // Session represents a long-lived spawned process.
@@ -248,10 +270,12 @@ func Run(ctx context.Context, argv []string, cwd string, env map[string]string, 
 		return classifyRunResult(err, ctx, &stdout, &stderr, start), classifyRunError(err, ctx)
 	}
 	return &RunResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: 0,
-		Duration: time.Since(start),
+		Stdout:          stdout.String(),
+		Stderr:          stderr.String(),
+		ExitCode:        0,
+		Duration:        time.Since(start),
+		StdoutTruncated: stdout.Truncated(),
+		StderrTruncated: stderr.Truncated(),
 	}, nil
 }
 
@@ -269,7 +293,9 @@ func (m *Multiplexer) Spawn(sessionID string, argv []string, cwd string, env map
 	}
 	if m.MaxSessions > 0 && len(m.sessions) >= m.MaxSessions {
 		m.mu.Unlock()
-		return fmt.Errorf("proc session limit reached (%d)", m.MaxSessions)
+		// This error propagates back to callers verbatim, so name the knob that
+		// controls the cap instead of looking like an opaque OS-level failure.
+		return fmt.Errorf("proc session limit reached (%d): relay-configured session cap; adjust with --max-sessions on the relay", m.MaxSessions)
 	}
 
 	// Keep the mux lock held across the OS launch and map insertion so Close or
@@ -538,7 +564,7 @@ func runWithContext(ctx context.Context, cmd *exec.Cmd) error {
 	}
 }
 
-func classifyRunResult(err error, ctx context.Context, stdout, stderr fmt.Stringer, started time.Time) *RunResult {
+func classifyRunResult(err error, ctx context.Context, stdout, stderr *limitedBuffer, started time.Time) *RunResult {
 	exitCode := 0
 	timedOut := ctx.Err() == context.DeadlineExceeded
 	if timedOut {
@@ -548,12 +574,16 @@ func classifyRunResult(err error, ctx context.Context, stdout, stderr fmt.String
 	} else {
 		exitCode = -1
 	}
+	// Partial output returned on timeout/cancel/failure can itself be
+	// truncated, so the flags must ride every result path, not just success.
 	return &RunResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
-		Duration: time.Since(started),
-		TimedOut: timedOut,
+		Stdout:          stdout.String(),
+		Stderr:          stderr.String(),
+		ExitCode:        exitCode,
+		Duration:        time.Since(started),
+		TimedOut:        timedOut,
+		StdoutTruncated: stdout.Truncated(),
+		StderrTruncated: stderr.Truncated(),
 	}
 }
 

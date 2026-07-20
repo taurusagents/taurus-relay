@@ -15,8 +15,14 @@ import (
 	"github.com/taurusagents/taurus-relay/internal/tunnel"
 )
 
-func Node(server, name, host, token, dataPath string, maxContainers int, insecure bool) error {
+// Node handles the `taurus-relay node` command. maxSessionsFlag is the raw
+// --max-sessions value (< 0 = flag not provided).
+func Node(server, name, host, token, dataPath string, maxContainers int, insecure bool, maxSessionsFlag int) error {
 	if err := validateNodePlatform(runtime.GOOS); err != nil {
+		return err
+	}
+	maxSessions, err := resolveMaxSessionsFromEnv(maxSessionsFlag, tunnel.DefaultNodeMaxSessions)
+	if err != nil {
 		return err
 	}
 	if server == "" {
@@ -45,7 +51,7 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 	if err := os.MkdirAll(dataPath, 0o755); err != nil {
 		return fmt.Errorf("create data path: %w", err)
 	}
-	dataPath, err := canonicalizeNodeDataPath(dataPath)
+	dataPath, err = canonicalizeNodeDataPath(dataPath)
 	if err != nil {
 		return err
 	}
@@ -63,6 +69,7 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 		Token:         token,
 		DataPath:      dataPath,
 		MaxContainers: maxContainers,
+		MaxSessions:   maxSessions,
 	})
 
 	sigCh := make(chan os.Signal, 1)
