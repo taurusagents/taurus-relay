@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"flag"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,49 @@ func TestResolveMaxSessionsPrecedence(t *testing.T) {
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected %d, got %d", tc.want, got)
+			}
+		})
+	}
+}
+
+func newMaxSessionsFlagSet() (*flag.FlagSet, *int) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	value := fs.Int("max-sessions", MaxSessionsFlagUnset, "")
+	return fs, value
+}
+
+func TestValidatedMaxSessionsFlag(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		want    int
+		wantErr bool
+	}{
+		{name: "not provided returns unset sentinel", args: nil, want: MaxSessionsFlagUnset},
+		{name: "explicit positive value passes through", args: []string{"--max-sessions", "7"}, want: 7},
+		{name: "explicit zero means unlimited", args: []string{"--max-sessions", "0"}, want: 0},
+		{name: "explicit negative is rejected", args: []string{"--max-sessions", "-5"}, wantErr: true},
+		{name: "explicit -1 is rejected, not treated as unset", args: []string{"--max-sessions=-1"}, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, value := newMaxSessionsFlagSet()
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse args: %v", err)
+			}
+			got, err := ValidatedMaxSessionsFlag(fs, "max-sessions", *value)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "--max-sessions") {
+					t.Fatalf("expected --max-sessions error, got %v", err)
 				}
 				return
 			}

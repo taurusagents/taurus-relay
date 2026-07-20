@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -29,4 +30,29 @@ func resolveMaxSessions(flagValue int, envValue string, modeDefault int) (int, e
 
 func resolveMaxSessionsFromEnv(flagValue, modeDefault int) (int, error) {
 	return resolveMaxSessions(flagValue, os.Getenv(EnvMaxSessions), modeDefault)
+}
+
+// MaxSessionsFlagUnset is the sentinel meaning "--max-sessions was not
+// provided", letting the env/default precedence chain take over.
+const MaxSessionsFlagUnset = -1
+
+// ValidatedMaxSessionsFlag inspects the parsed flag set to distinguish a flag
+// that was never provided (returns MaxSessionsFlagUnset) from an explicit
+// value. Explicit negative values — including -1, which would otherwise be
+// mistaken for the unset sentinel — are rejected instead of silently falling
+// through to the env/default precedence chain.
+func ValidatedMaxSessionsFlag(fs *flag.FlagSet, name string, value int) (int, error) {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	if !provided {
+		return MaxSessionsFlagUnset, nil
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("invalid --%s value %d: must be a non-negative integer (0 = unlimited)", name, value)
+	}
+	return value, nil
 }
