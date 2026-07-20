@@ -5,7 +5,11 @@ import (
 	"sync"
 )
 
-const DefaultMaxSessions = 50
+// DefaultMaxSessions is the library-level fallback session cap applied by
+// NewMultiplexer. The relay CLI normally overrides it (--max-sessions /
+// TAURUS_RELAY_MAX_SESSIONS); the cap is an adjustable operational ceiling,
+// not a defense mechanism.
+const DefaultMaxSessions = 128
 
 // Multiplexer manages multiple concurrent shell sessions.
 type Multiplexer struct {
@@ -40,7 +44,9 @@ func (m *Multiplexer) Create(id, shell string, args []string, cwd string, env ma
 	}
 
 	if m.MaxSessions > 0 && len(m.sessions) >= m.MaxSessions {
-		return nil, fmt.Errorf("session limit reached (%d)", m.MaxSessions)
+		// This error propagates back to callers verbatim, so name the knob that
+		// controls the cap instead of looking like an opaque OS-level failure.
+		return nil, fmt.Errorf("shell session limit reached (%d): relay-configured session cap; adjust with --max-sessions on the relay", m.MaxSessions)
 	}
 
 	sess, err := NewSession(id, shell, args, cwd, env, m.onOutput, func(sessionID string, exitCode int) {

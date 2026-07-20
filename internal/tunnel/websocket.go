@@ -33,6 +33,15 @@ const (
 	ModeNode    Mode = "node"
 )
 
+// Mode-default session caps. The cap is an adjustable operational ceiling
+// (overridable via --max-sessions / TAURUS_RELAY_MAX_SESSIONS), not a defense
+// mechanism, so the node-mode default is intentionally high enough to stay out
+// of the way of normal operation while still being a real, settable number.
+const (
+	DefaultConnectMaxSessions = 128
+	DefaultNodeMaxSessions    = 1 << 20 // 1048576
+)
+
 const (
 	controlQueueSize        = 256
 	sessionQueueMaxMessages = 128
@@ -62,6 +71,10 @@ type NodeOptions struct {
 	Token         string
 	DataPath      string
 	MaxContainers int
+	// MaxSessions is the effective cap on concurrent proc sessions; 0 means
+	// unlimited. The CLI layer resolves flag/env/mode-default precedence
+	// before constructing the tunnel.
+	MaxSessions int
 }
 
 // runtimeSnapshot captures the runtime-bound objects a request is allowed to
@@ -99,6 +112,9 @@ type Tunnel struct {
 
 	shells *shell.Multiplexer
 	procs  *proc.Multiplexer
+	// maxSessions is the effective concurrent-session cap applied to the
+	// multiplexers of this tunnel's mode (0 = unlimited).
+	maxSessions int
 
 	priorityControlQ chan *protocol.Message
 	normalControlQ   chan *protocol.Message
@@ -140,27 +156,33 @@ func outputSessionQueueKey(namespace outputSessionNamespace, sessionID string) s
 	return string(namespace) + "\x00" + sessionID
 }
 
-// New creates a new Tunnel for user relay mode.
-func New(cfg *config.Config, token string) *Tunnel {
-	return newTunnel(cfg, token, ModeConnect, nil)
+// New creates a new Tunnel for user relay mode. maxSessions is the effective
+// cap on concurrent shell/proc sessions (0 = unlimited); callers resolve
+// flag/env/default precedence before constructing the tunnel.
+func New(cfg *config.Config, token string, maxSessions int) *Tunnel {
+	return newTunnel(cfg, token, ModeConnect, nil, maxSessions)
 }
 
 // NewNode creates a new Tunnel for node relay mode.
 func NewNode(server string, opts NodeOptions) *Tunnel {
 	cfg := &config.Config{Server: server}
-	return newTunnel(cfg, opts.Token, ModeNode, &opts)
+	return newTunnel(cfg, opts.Token, ModeNode, &opts, opts.MaxSessions)
 }
 
-func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOptions) *Tunnel {
+func newTunnel(cfg *config.Config, token string, mode Mode, nodeOpts *NodeOptions, maxSessions int) *Tunnel {
 	ctx, cancel := context.WithCancel(context.Background())
 	runtimeCtx, runtimeCancel := context.WithCancel(ctx)
 
+	if maxSessions < 0 {
+		maxSessions = 0 // treat nonsense input as unlimited rather than "reject everything"
+	}
 	t := &Tunnel{
 		cfg:              cfg,
 		token:            token,
 		reconnCfg:        DefaultReconnectConfig(),
 		mode:             mode,
 		node:             nodeOpts,
+		maxSessions:      maxSessions,
 		handler:          protocol.NewHandler(),
 		priorityControlQ: make(chan *protocol.Message, controlQueueSize),
 		normalControlQ:   make(chan *protocol.Message, controlQueueSize),
@@ -374,6 +396,7 @@ func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
 				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceShell, sessionID, protocol.PriorityNormal, &protocol.Message{Type: protocol.TypeShellExit, Payload: payload}, len(payload))
 			},
 		)
+		t.shells.MaxSessions = t.maxSessions
 	}
 
 	if t.mode == ModeConnect || (t.mode == ModeNode && t.node != nil) {
@@ -395,6 +418,7 @@ func (t *Tunnel) rebuildRuntimeMultiplexers(generation uint64) {
 				t.enqueueOutputForSessionForGeneration(generation, outputSessionNamespaceProc, sessionID, priority, &protocol.Message{Type: protocol.TypeProcExit, Payload: payload, Priority: priority}, len(payload))
 			},
 		)
+		t.procs.MaxSessions = t.maxSessions
 	}
 }
 
@@ -670,16 +694,7 @@ func (t *Tunnel) authenticateNode() error {
 	ramGB, cpus := health.NodeAllocatable()
 	hostname, _ := os.Hostname()
 	sys := health.SysInfo(0)
-	payload := protocol.NodeRegisterPayload{
-		Type:             "node",
-		Name:             t.node.Name,
-		Host:             t.node.Host,
-		EnrollmentToken:  t.token,
-		AllocatableRAMGB: ramGB,
-		AllocatableCPUs:  cpus,
-		MaxContainers:    t.node.MaxContainers,
-		Meta:             buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
-	}
+	payload := t.buildNodeRegisterPayload(ramGB, cpus, sys, hostname)
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal node.register payload: %w", err)
@@ -707,6 +722,24 @@ func (t *Tunnel) authenticateNode() error {
 	}
 	log.Printf("[tunnel] registered node %s", result.NodeID)
 	return nil
+}
+
+// buildNodeRegisterPayload assembles the node registration message. It
+// advertises the effective proc-session cap so the control plane can base its
+// own session thresholds on the real configured limit instead of assuming a
+// hardcoded value; the field is omitted when the cap is unlimited.
+func (t *Tunnel) buildNodeRegisterPayload(ramGB float64, cpus int, sys *protocol.HeartbeatPayload, hostname string) protocol.NodeRegisterPayload {
+	return protocol.NodeRegisterPayload{
+		Type:             "node",
+		Name:             t.node.Name,
+		Host:             t.node.Host,
+		EnrollmentToken:  t.token,
+		AllocatableRAMGB: ramGB,
+		AllocatableCPUs:  cpus,
+		MaxContainers:    t.node.MaxContainers,
+		MaxProcSessions:  t.maxSessions,
+		Meta:             buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
+	}
 }
 
 // buildNodeRegisterMeta publishes the canonical Taurus data root plus the exact

@@ -123,6 +123,11 @@ point the relay at a different config directory with `--config-dir` (or the
 The directory always contains a file named `config.json`. `taurus-relay status`
 accepts the same `--config-dir` flag.
 
+The number of concurrent sessions (shell and proc) the relay will host is
+capped at 128 by default in connect mode. Override it with `--max-sessions <n>`
+(or the `TAURUS_RELAY_MAX_SESSIONS` environment variable; the flag wins if both
+are set); `0` means unlimited.
+
 ### Node mode (Linux hosts)
 
 `node` mode is supported on Linux hosts. Windows releases are connect-only, and `taurus-relay node` exits immediately with an explicit unsupported error on Windows.
@@ -145,6 +150,9 @@ Flags:
 - `--token` node enrollment token
 - `--data-path` base path for Taurus drives on the node
 - `--max-containers` optional node capacity hint
+- `--max-sessions` cap on concurrent proc sessions (default: 1048576; `0` = unlimited;
+  also settable via `TAURUS_RELAY_MAX_SESSIONS`, the flag wins). The effective cap is
+  reported to the control plane at registration.
 - `--insecure` allow non-TLS `http://` / `ws://` for local development only
 
 ## Expected control plane compatibility

@@ -707,8 +707,14 @@ func TestMultiplexerSessionLimit(t *testing.T) {
 		t.Fatalf("first Spawn returned error: %v", err)
 	}
 	defer mux.KillAll()
-	if err := mux.Spawn("limit-2", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, PriorityNormal); err == nil {
+	err := mux.Spawn("limit-2", []string{"bash", "-lc", "sleep 10"}, "", nil, false, 0, 0, PriorityNormal)
+	if err == nil {
 		t.Fatalf("expected session limit error")
+	}
+	// The rejection travels back to remote callers, so it must clearly identify
+	// itself as the relay-configured cap and name the knob that changes it.
+	if !strings.Contains(err.Error(), "proc session limit reached (1)") || !strings.Contains(err.Error(), "--max-sessions") {
+		t.Fatalf("expected actionable relay-cap error, got %q", err.Error())
 	}
 }
 

@@ -629,7 +629,7 @@ func TestHandleProcSpawnRejectsSessionReuseWhileOldOutputIsStillQueued(t *testin
 }
 
 func TestResetRuntimeStateRejectsStaleShellCreate(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	oldShells := tun.shells
 	if oldShells == nil {
 		t.Fatalf("expected shell multiplexer to be initialized")
@@ -653,7 +653,7 @@ func TestResetRuntimeStateRejectsStaleShellCreate(t *testing.T) {
 }
 
 func TestResetRuntimeStateRetiresOldShellMuxBeforeKillAll(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	oldShells := tun.shells
 	if oldShells == nil {
 		t.Fatalf("expected shell multiplexer to be initialized")
@@ -672,7 +672,7 @@ func TestResetRuntimeStateRetiresOldShellMuxBeforeKillAll(t *testing.T) {
 }
 
 func TestHandleShellCreateQueuesExitAfterOutputAndRejectsReuseUntilDrain(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	generation := tun.currentRuntimeGeneration()
 	payload, err := json.Marshal(protocol.ShellCreatePayload{
 		SessionID: "reused-shell-session",
@@ -721,7 +721,7 @@ func TestHandleShellCreateQueuesExitAfterOutputAndRejectsReuseUntilDrain(t *test
 }
 
 func TestConnectModeRegistersProcHandlersForAutomationShells(t *testing.T) {
-	tun := New(&config.Config{Server: "https://example.com"}, "")
+	tun := New(&config.Config{Server: "https://example.com"}, "", DefaultConnectMaxSessions)
 	generation := tun.currentRuntimeGeneration()
 
 	runPayload, err := json.Marshal(protocol.ProcRunPayload{Argv: []string{"bash", "-lc", "printf run-ok"}})

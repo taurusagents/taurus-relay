@@ -16,7 +16,11 @@ import (
 )
 
 const (
-	DefaultMaxSessions = 50
+	// DefaultMaxSessions is the library-level fallback session cap applied by
+	// NewMultiplexer. The relay CLI normally overrides it per mode
+	// (--max-sessions / TAURUS_RELAY_MAX_SESSIONS); the cap is an adjustable
+	// operational ceiling, not a defense mechanism.
+	DefaultMaxSessions = 128
 	PriorityNormal     = "normal"
 	PriorityPriority   = "priority"
 	defaultExecPath    = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -289,7 +293,9 @@ func (m *Multiplexer) Spawn(sessionID string, argv []string, cwd string, env map
 	}
 	if m.MaxSessions > 0 && len(m.sessions) >= m.MaxSessions {
 		m.mu.Unlock()
-		return fmt.Errorf("proc session limit reached (%d)", m.MaxSessions)
+		// This error propagates back to callers verbatim, so name the knob that
+		// controls the cap instead of looking like an opaque OS-level failure.
+		return fmt.Errorf("proc session limit reached (%d): relay-configured session cap; adjust with --max-sessions on the relay", m.MaxSessions)
 	}
 
 	// Keep the mux lock held across the OS launch and map insertion so Close or
