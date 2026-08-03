@@ -36,9 +36,11 @@ func WriteContext(ctx context.Context, p *protocol.FileWritePayload) (*protocol.
 		return nil, err
 	}
 
-	// Create parent directories before we open the temp file.
+	// Create parent directories before we open the temp file. EnsureOwnedDir is
+	// the single choke point that hands every directory the relay creates under a
+	// managed drive root to the drive owner (see owner.go).
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := EnsureOwnedDir(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create directories: %w", err)
 	}
 
@@ -72,6 +74,12 @@ func WriteContext(ctx context.Context, p *protocol.FileWritePayload) (*protocol.
 	if err := tmp.Chmod(mode); err != nil {
 		return nil, fmt.Errorf("chmod temp file: %w", err)
 	}
+	// Ownership is applied to the open temp file, before the rename: rename(2)
+	// preserves ownership, so the published file lands owned by the drive owner
+	// with no window in which it exists under the target name owned by the relay.
+	if err := chownCreatedFile(tmp, path); err != nil {
+		return nil, err
+	}
 	if err := tmp.Close(); err != nil {
 		return nil, fmt.Errorf("close temp file: %w", err)
 	}
@@ -104,10 +112,59 @@ func MkdirContext(ctx context.Context, p *protocol.FileMkdirPayload) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	if p.Recursive {
-		return os.MkdirAll(path, 0o755)
+
+	mode := os.FileMode(0o755)
+	if p.Mode != 0 {
+		mode = os.FileMode(p.Mode)
 	}
-	return os.Mkdir(path, 0o755)
+
+	if p.Recursive {
+		return EnsureOwnedDir(path, mode)
+	}
+	if err := os.Mkdir(path, mode); err != nil {
+		return err
+	}
+	// mkdir(2) masks the mode with the umask; chown after so a caller-requested
+	// mode such as 0700 for codex-config is what actually lands on disk.
+	if err := os.Chmod(path, mode); err != nil {
+		return err
+	}
+	return chownCreatedPath(path)
+}
+
+// EnsureFile creates an empty regular file if it is missing, owned by the drive
+// owner, and validates an existing one without touching its contents.
+func EnsureFile(p *protocol.FileEnsureFilePayload) (*protocol.FileEnsureFileResultPayload, error) {
+	return EnsureFileContext(context.Background(), p)
+}
+
+// EnsureFileContext backs the file.ensure_file verb. Taurus uses it to bootstrap
+// the codex auth.json host file that is bind-mounted into subscription
+// containers: the file must exist before `docker create`, must never clobber
+// live credentials, and — under userns-remap — must be owned by the drive owner
+// or the container cannot read its own 0600 credential file.
+func EnsureFileContext(ctx context.Context, p *protocol.FileEnsureFilePayload) (*protocol.FileEnsureFileResultPayload, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	path, err := ValidatePath(p.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+
+	mode := os.FileMode(0o600)
+	if p.Mode != 0 {
+		mode = os.FileMode(p.Mode)
+	}
+
+	created, err := EnsureOwnedFile(path, mode)
+	if err != nil {
+		return nil, err
+	}
+	return &protocol.FileEnsureFileResultPayload{Created: created}, nil
 }
 
 // Remove removes a file or directory.

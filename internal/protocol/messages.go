@@ -232,6 +232,21 @@ type FileGrepResultPayload struct {
 type FileMkdirPayload struct {
 	Path      string `json:"path"`
 	Recursive bool   `json:"recursive,omitempty"`
+	// Mode is the permission bits for directories this request creates
+	// (0 = the 0755 default). Directories that already exist are never chmodded.
+	Mode uint32 `json:"mode,omitempty"`
+}
+
+// FileEnsureFilePayload asks the relay to make sure a regular file exists at
+// Path, without ever overwriting one that is already there.
+type FileEnsureFilePayload struct {
+	Path string `json:"path"`
+	Mode uint32 `json:"mode,omitempty"` // 0 = 0600
+}
+
+type FileEnsureFileResultPayload struct {
+	// Created is false when the file was already present and was left untouched.
+	Created bool `json:"created"`
 }
 
 type FileRemovePayload struct {
@@ -351,6 +366,10 @@ const (
 	TypeFileMkdirResult  = "file.mkdir.result"
 	TypeFileRemove       = "file.remove"
 	TypeFileRemoveResult = "file.remove.result"
+	// file.ensure_file creates a missing regular file (owned by the configured
+	// drive owner) and leaves an existing one untouched.
+	TypeFileEnsureFile       = "file.ensure_file"
+	TypeFileEnsureFileResult = "file.ensure_file.result"
 
 	TypeAuth               = "auth"
 	TypeAuthResult         = "auth.result"
