@@ -453,6 +453,10 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeProcSignal, t.handleProcSignal)
 		h.Register(protocol.TypeProcKill, t.handleProcKill)
 		h.Register(protocol.TypeProcCheckAlive, t.handleProcCheckAlive)
+		// Node-mode only: file.ensure_file exists so Taurus can bootstrap the
+		// codex auth.json host file with the drive owner applied. Connect-mode
+		// relays have no drive tree and keep exactly the file surface they had.
+		h.Register(protocol.TypeFileEnsureFile, t.handleFileEnsureFile)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -462,7 +466,6 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 	h.Register(protocol.TypeFileGrep, t.handleFileGrep)
 	h.Register(protocol.TypeFileMkdir, t.handleFileMkdir)
 	h.Register(protocol.TypeFileRemove, t.handleFileRemove)
-	h.Register(protocol.TypeFileEnsureFile, t.handleFileEnsureFile)
 
 	h.Register(protocol.TypePing, func(_ *protocol.Message) (string, any, error) {
 		return protocol.TypePong, map[string]string{"status": "ok"}, nil
