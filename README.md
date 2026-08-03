@@ -204,30 +204,42 @@ plane as the `taurus_drive_owner` node metadata key.
 
 Applying that ownership needs `CAP_CHOWN` (chown to a foreign uid), `CAP_DAC_OVERRIDE`
 (create inside directories owned by the remap base) and `CAP_FOWNER` (chmod/rename them).
-A systemd unit grants them without running the relay as root:
+Grant them as **file capabilities on the binary**, not as ambient capabilities:
+
+```bash
+setcap cap_chown,cap_dac_override,cap_fowner=ep /usr/local/bin/taurus-relay
+```
 
 ```ini
 [Service]
 User=taurus
-# NOTE: AmbientCapabilities are inherited by every process the relay exec's,
-# including the docker CLI it drives on the daemon's behalf. That is an accepted
-# trade-off on a node whose relay user is already in the `docker` group (which is
-# root-equivalent), but it *is* wider than "the relay can chown drive dirs".
-AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
-# NoNewPrivileges must stay off: the node runs `sudo -n taurus-quota` for XFS
-# project-quota enforcement, and no_new_privs disables setuid binaries including sudo.
+# NoNewPrivileges must stay off. It disables every setuid binary — including the
+# sudo that runs `taurus-quota` for XFS project-quota enforcement — and under it
+# exec of a file-capability binary fails outright with EPERM, so the relay would
+# not start at all (loudly, at least).
 NoNewPrivileges=no
+# Do NOT add CapabilityBoundingSet: it applies to every descendant and can never
+# be raised, so a bounding set of these three capabilities leaves
+# `sudo taurus-quota` running as uid 0 without CAP_SYS_ADMIN (needed by
+# `xfs_quota -x -c limit`) or CAP_DAC_READ_SEARCH (needed by `du`).
 ```
 
-If you would rather not extend the capabilities to the relay's children, drop
-`AmbientCapabilities` and put the same three capabilities on the binary instead
-(`setcap cap_chown,cap_dac_override,cap_fowner=ep /usr/local/bin/taurus-relay`), keeping
-`CapabilityBoundingSet` and `NoNewPrivileges=no`. File capabilities are **not** inherited
-by exec'd children. The trade-off is that `setcap` must be re-applied after every binary
-upgrade — the startup self-check turns a forgotten `setcap` into a refused start rather
-than a silently mis-owned drive tree.
+Why file capabilities rather than `AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER`:
+ambient capabilities are **inherited by every process the relay exec's** — the docker CLI,
+`mv`, `rm`, `cp`, and the shell snippets the daemon sends — which is much wider than "the
+relay can chown drive dirs". (They are dropped when exec'ing a setuid or file-capability
+binary, so `sudo` does not inherit them; every *plain* binary does.) File capabilities are
+not inherited at all.
 
+The cost of file capabilities is that they live in the binary's extended attributes: they
+are **lost on every upgrade that replaces the file** (`cp`, `install`, a new release
+tarball) and are **inert on a filesystem mounted `nosuid`**. Re-run `setcap` after each
+upgrade — the relay's startup self-check turns a forgotten `setcap` into a refused start
+rather than a silently mis-owned drive tree, and `getcap /usr/local/bin/taurus-relay`
+confirms it.
+
+Ambient capabilities remain a valid alternative if you prefer upgrade-proof configuration
+over child isolation; the relay does not care which mechanism supplied its authority.
 Running the relay as `root` also works and needs no capability configuration.
 
 ## Expected control plane compatibility
