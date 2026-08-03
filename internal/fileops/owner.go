@@ -248,10 +248,13 @@ func EnsureOwnedDir(path string, mode os.FileMode) error {
 		// os.MkdirAll, which this replaced, follows a final symlink and succeeds
 		// when it points at a directory. Connect-mode relays run against real
 		// user home directories where that is ordinary (a symlinked project dir),
-		// so keep the behavior rather than turning it into ENOTDIR. Node mode is
-		// unaffected: ValidatePath has already resolved the path, and nothing in
-		// the drive layout is legitimately a symlink.
-		if info.Mode()&os.ModeSymlink != 0 {
+		// so keep the behavior there.
+		//
+		// Inside a managed drive root it stays a hard error: nothing in the drive
+		// layout is legitimately a symlink, so one appearing at the leaf between
+		// ValidatePath resolving the path and this call is a swap attempt, and
+		// following it would widen exactly the surface #358 is about.
+		if info.Mode()&os.ModeSymlink != 0 && ownerFor(path) == nil {
 			if target, statErr := os.Stat(path); statErr == nil && target.IsDir() {
 				return nil
 			}
@@ -400,7 +403,8 @@ func verifyExistingOwner(path string, info os.FileInfo) error {
 	if uid != owner.UID || gid != owner.GID {
 		return fmt.Errorf(
 			"%s already exists but is owned by %d:%d instead of the configured drive owner %s; "+
-				"the drive tree was not migrated (chown -R %s ...) and the container cannot read it",
+				"either the drive tree was not migrated (chown -R %s ...), or a container rewrote it "+
+				"under a different in-container uid (container root owns this path and may chown it)",
 			path, uid, gid, owner, owner)
 	}
 	return nil

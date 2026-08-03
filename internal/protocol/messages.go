@@ -266,6 +266,13 @@ type FileCopyResultPayload struct {
 	Copied int `json:"copied"`
 }
 
+// FileRenamePayload asks the node to rename(2) a path. The destination is never
+// clobbered, and the operation can never degrade into copy+delete.
+type FileRenamePayload struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
 type FileRemovePayload struct {
 	Path      string `json:"path"`
 	Recursive bool   `json:"recursive,omitempty"`
@@ -390,6 +397,9 @@ const (
 	// file.copy copies files node-locally with drive ownership applied.
 	TypeFileCopy       = "file.copy"
 	TypeFileCopyResult = "file.copy.result"
+	// file.rename is a true rename(2) that refuses to clobber its destination.
+	TypeFileRename       = "file.rename"
+	TypeFileRenameResult = "file.rename.result"
 
 	TypeAuth               = "auth"
 	TypeAuthResult         = "auth.result"

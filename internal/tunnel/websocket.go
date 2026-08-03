@@ -458,6 +458,7 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		// relays have no drive tree and keep exactly the file surface they had.
 		h.Register(protocol.TypeFileEnsureFile, t.handleFileEnsureFile)
 		h.Register(protocol.TypeFileCopy, t.handleFileCopy)
+		h.Register(protocol.TypeFileRename, t.handleFileRename)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -1658,6 +1659,21 @@ func (t *Tunnel) handleFileCopy(msg *protocol.Message) (string, any, error) {
 		return protocol.TypeFileCopyResult, nil, err
 	}
 	return protocol.TypeFileCopyResult, result, nil
+}
+
+func (t *Tunnel) handleFileRename(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	var p protocol.FileRenamePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	if err := fileops.RenameContext(runtime.ctx, &p); err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	return protocol.TypeFileRenameResult, map[string]string{"status": "ok"}, nil
 }
 
 func (t *Tunnel) handleFileRemove(msg *protocol.Message) (string, any, error) {

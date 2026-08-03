@@ -557,6 +557,9 @@ func TestEnsureOwnedDirAcceptsSymlinkToDirectory(t *testing.T) {
 	if err := EnsureOwnedDir(link, 0); err != nil {
 		t.Fatalf("expected a symlink to a directory to be accepted like os.MkdirAll: %v", err)
 	}
+	if err := EnsureOwnedDir(filepath.Join(link, "child"), 0); err != nil {
+		t.Fatalf("expected mkdir under a symlinked directory to work: %v", err)
+	}
 	// And through the actual verb, which is what a connect-mode relay serves.
 	if err := MkdirContext(context.Background(), &protocol.FileMkdirPayload{Path: filepath.Join(link, "child"), Recursive: true}); err != nil {
 		t.Fatalf("expected mkdir under a symlinked directory to work: %v", err)
@@ -663,5 +666,32 @@ func TestCopyContextRefusesPathsOutsideAllowedRoots(t *testing.T) {
 	}
 	if _, err := os.Stat("/tmp/escaped.png"); !os.IsNotExist(err) {
 		t.Fatalf("expected nothing to be written outside the allowed roots, got %v", err)
+	}
+}
+
+// The node-mode half of the symlink rule: inside a managed drive root a symlink
+// at the leaf is refused rather than followed. Nothing in the drive layout is
+// legitimately a symlink, so one appearing between ValidatePath resolving the
+// path and the mkdir is a swap attempt.
+func TestEnsureOwnedDirRefusesASymlinkedLeafInsideADriveRoot(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	outside := filepath.Join(dataRoot, "elsewhere")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drives := filepath.Join(dataRoot, DrivesDirName)
+	if err := EnsureOwnedDir(drives, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(drives, "user-1")
+	if err := os.Symlink(outside, planted); err != nil {
+		t.Fatal(err)
+	}
+
+	err := EnsureOwnedDir(planted, 0o755)
+	if err == nil || !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("expected a symlinked leaf inside a drive root to be refused with ENOTDIR, got %v", err)
 	}
 }

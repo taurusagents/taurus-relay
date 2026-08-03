@@ -96,6 +96,11 @@ func copyOneOwned(src, dest string, mode os.FileMode) error {
 		}
 	}()
 
+	// NOTE: io.Copy is not interruptible, so a very large artifact cannot be
+	// cancelled mid-stream the way the killable `sh -c cp` it replaced could. The
+	// caller checks the runtime context between pairs. Artifacts are images and
+	// tool outputs (single-digit MB), so this is recorded rather than fixed; a
+	// chunked copy with a per-chunk checkContext is the fix if that changes.
 	if _, err := io.Copy(tmp, in); err != nil {
 		return fmt.Errorf("copy %s -> %s: %w", src, dest, err)
 	}
