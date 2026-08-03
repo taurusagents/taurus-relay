@@ -113,21 +113,25 @@ func MkdirContext(ctx context.Context, p *protocol.FileMkdirPayload) error {
 		return err
 	}
 
+	// A zero mode keeps the historical behavior: 0755 filtered by the process
+	// umask. An explicit mode (codex-config 0700) is applied exactly.
+	if p.Recursive {
+		return EnsureOwnedDir(path, os.FileMode(p.Mode))
+	}
+
 	mode := os.FileMode(0o755)
 	if p.Mode != 0 {
 		mode = os.FileMode(p.Mode)
 	}
-
-	if p.Recursive {
-		return EnsureOwnedDir(path, mode)
-	}
 	if err := os.Mkdir(path, mode); err != nil {
 		return err
 	}
-	// mkdir(2) masks the mode with the umask; chown after so a caller-requested
-	// mode such as 0700 for codex-config is what actually lands on disk.
-	if err := os.Chmod(path, mode); err != nil {
-		return err
+	if p.Mode != 0 {
+		// mkdir(2) masks the mode with the umask; chmod is the only way to get
+		// the mode the caller actually asked for.
+		if err := os.Chmod(path, mode); err != nil {
+			return err
+		}
 	}
 	return chownCreatedPath(path)
 }

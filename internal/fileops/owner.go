@@ -225,7 +225,18 @@ func chownCreatedFile(f *os.File, path string) error {
 // exactly as they are — the relay owns what it creates and nothing else, so a
 // stray path under the drive root can never make it rewrite ownership of an
 // existing tree.
+//
+// Modes:
+//   - mode 0 means "the 0755 default, filtered by the process umask" — exactly
+//     what os.MkdirAll(path, 0755) did before, so a user's connect-mode relay
+//     with a restrictive umask keeps creating restrictive directories;
+//   - a non-zero mode is applied exactly (codex-config 0700 means 0700);
+//   - **inside a managed drive root the mode is always applied exactly**, umask
+//     or not. Drive directory permissions are part of the ownership contract the
+//     container depends on, and must not silently depend on the relay unit's
+//     UMask= setting.
 func EnsureOwnedDir(path string, mode os.FileMode) error {
+	callerSetMode := mode != 0
 	if mode == 0 {
 		mode = 0o755
 	}
@@ -248,7 +259,8 @@ func EnsureOwnedDir(path string, mode os.FileMode) error {
 	for i := len(missing) - 1; i >= 0; i-- {
 		component := missing[i]
 		componentMode := os.FileMode(0o755)
-		if component == filepath.Clean(path) {
+		isLeaf := component == filepath.Clean(path)
+		if isLeaf {
 			componentMode = mode
 		}
 
@@ -261,10 +273,12 @@ func EnsureOwnedDir(path string, mode os.FileMode) error {
 			}
 			return err
 		}
-		// mkdir(2) masks the mode with the process umask, so an explicit chmod
-		// is the only way to get the mode the caller actually asked for.
-		if err := os.Chmod(component, componentMode); err != nil {
-			return err
+		// mkdir(2) masks the mode with the process umask, so an explicit chmod is
+		// the only way to get the mode that was actually asked for.
+		if (isLeaf && callerSetMode) || ownerFor(component) != nil {
+			if err := os.Chmod(component, componentMode); err != nil {
+				return err
+			}
 		}
 		if err := chownCreatedPath(component); err != nil {
 			return err
