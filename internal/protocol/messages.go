@@ -249,6 +249,23 @@ type FileEnsureFileResultPayload struct {
 	Created bool `json:"created"`
 }
 
+// FileCopyPayload asks the node to copy files locally, on the node's own disk,
+// through the same ownership choke point as every other relay-side write.
+type FileCopyPayload struct {
+	Pairs []FileCopyPair `json:"pairs"`
+	// Mode overrides the destination permission bits; 0 keeps the source's.
+	Mode uint32 `json:"mode,omitempty"`
+}
+
+type FileCopyPair struct {
+	Src  string `json:"src"`
+	Dest string `json:"dest"`
+}
+
+type FileCopyResultPayload struct {
+	Copied int `json:"copied"`
+}
+
 type FileRemovePayload struct {
 	Path      string `json:"path"`
 	Recursive bool   `json:"recursive,omitempty"`
@@ -370,6 +387,9 @@ const (
 	// drive owner) and leaves an existing one untouched.
 	TypeFileEnsureFile       = "file.ensure_file"
 	TypeFileEnsureFileResult = "file.ensure_file.result"
+	// file.copy copies files node-locally with drive ownership applied.
+	TypeFileCopy       = "file.copy"
+	TypeFileCopyResult = "file.copy.result"
 
 	TypeAuth               = "auth"
 	TypeAuthResult         = "auth.result"

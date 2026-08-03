@@ -49,11 +49,10 @@ func WriteContext(ctx context.Context, p *protocol.FileWritePayload) (*protocol.
 		mode = os.FileMode(p.Mode)
 	}
 
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	tmp, tmpPath, err := createStagingFile(dir, filepath.Base(path))
 	if err != nil {
 		return nil, fmt.Errorf("create temp file: %w", err)
 	}
-	tmpPath := tmp.Name()
 	defer func() {
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)

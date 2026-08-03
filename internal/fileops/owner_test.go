@@ -323,10 +323,10 @@ func TestMkdirContextAppliesModeAndOwnership(t *testing.T) {
 	assertOwnedOnDisk(t, codexConfig, remapBase)
 }
 
-// auth.json bootstrap: create it 0600 owned by the remap base (otherwise the
-// container cannot read its own credential file), and never clobber one that
-// already holds live credentials.
-func TestEnsureFileCreatesOwnedCredentialFileAndNeverClobbers(t *testing.T) {
+// auth.json bootstrap: create it 0600 owned by the remap base, otherwise the
+// container cannot read its own credential file through the single-file bind
+// mount.
+func TestEnsureFileCreatesAnOwnedCredentialFile(t *testing.T) {
 	rec := newChownRecorder(t)
 	dataRoot := withDriveOwnership(t, &remapBase)
 
@@ -351,11 +351,26 @@ func TestEnsureFileCreatesOwnedCredentialFileAndNeverClobbers(t *testing.T) {
 	}
 	assertOwnedOnDisk(t, authFile, remapBase)
 
-	// Live credentials must survive a second launch of the same subscription.
+}
+
+// Second launch of the same subscription: the credentials that codex wrote must
+// survive untouched. The owner here is the running process's own ids so the file
+// is genuinely correctly-owned on disk in both the privileged and unprivileged
+// test environments — the wrongly-owned case is its own test below.
+func TestEnsureFileNeverClobbersLiveCredentials(t *testing.T) {
+	newChownRecorder(t)
+	self := DriveOwner{UID: os.Geteuid(), GID: os.Getegid()}
+	dataRoot := withDriveOwnership(t, &self)
+
+	authFile := filepath.Join(dataRoot, DrivesDirName, "user-1", "codex-config", "auth.json")
+	if _, err := EnsureFileContext(context.Background(), &protocol.FileEnsureFilePayload{Path: authFile, Mode: 0o600}); err != nil {
+		t.Fatalf("EnsureFileContext: %v", err)
+	}
 	if err := os.WriteFile(authFile, []byte(`{"token":"live"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	result, err = EnsureFileContext(context.Background(), &protocol.FileEnsureFilePayload{Path: authFile, Mode: 0o600})
+
+	result, err := EnsureFileContext(context.Background(), &protocol.FileEnsureFilePayload{Path: authFile, Mode: 0o600})
 	if err != nil {
 		t.Fatalf("EnsureFileContext (existing): %v", err)
 	}
@@ -467,5 +482,186 @@ func TestVerifyDriveOwnershipIsNoOpWithoutOwner(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataRoot, DrivesDirName)); !os.IsNotExist(err) {
 		t.Fatalf("expected no drive roots to be created without an owner, got %v", err)
+	}
+}
+
+// The regression critic4 caught: an auth.json left behind by a relay that
+// predates drive ownership is owned by the relay's uid, and the container that
+// bind-mounts it at 0600 cannot read its own credentials. Passing it through
+// silently reproduces #357 for every existing subscription agent.
+func TestEnsureFileRefusesAnExistingFileOwnedBySomeoneElse(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	authFile := filepath.Join(dataRoot, DrivesDirName, "user-1", "codex-config", "auth.json")
+	if err := EnsureOwnedDir(filepath.Dir(authFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Written directly, i.e. owned by this process rather than the remap base —
+	// exactly what a pre-migration relay left on disk.
+	if err := os.WriteFile(authFile, []byte(`{"token":"stale"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := EnsureFileContext(context.Background(), &protocol.FileEnsureFilePayload{Path: authFile, Mode: 0o600})
+	if err == nil {
+		t.Fatal("expected a wrongly-owned existing credential file to be refused")
+	}
+	if !strings.Contains(err.Error(), "was not migrated") {
+		t.Fatalf("expected the error to name the migration, got: %v", err)
+	}
+	// Refused, never repaired: a quiet chown would hide an unmigrated tree.
+	content, readErr := os.ReadFile(authFile)
+	if readErr != nil || string(content) != `{"token":"stale"}` {
+		t.Fatalf("the refused file must be left untouched, got %q %v", content, readErr)
+	}
+}
+
+// Ownership of pre-existing files is only Taurus's business inside the drive
+// roots. Connect-mode relays (and the node's own runtime staging paths) must not
+// start failing on files they do not own.
+func TestEnsureFileIgnoresOwnershipOutsideDriveRoots(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	outside := filepath.Join(dataRoot, "runtime", "marker")
+	if err := EnsureOwnedDir(filepath.Dir(outside), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureFileContext(context.Background(), &protocol.FileEnsureFilePayload{Path: outside}); err != nil {
+		t.Fatalf("expected no ownership opinion outside the drive roots, got %v", err)
+	}
+}
+
+// MkdirAll (which EnsureOwnedDir replaced) follows a final symlink pointing at a
+// directory and succeeds. Connect-mode relays run against real home directories
+// where symlinked project dirs are ordinary, so this must keep working — it is
+// currently also protected by ValidatePath's EvalSymlinks, and this pins the
+// behavior one refactor away from that.
+func TestEnsureOwnedDirAcceptsSymlinkToDirectory(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, nil) // connect-mode shape: no drive owner
+
+	real := filepath.Join(dataRoot, "real-dir")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dataRoot, "link-dir")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureOwnedDir(link, 0); err != nil {
+		t.Fatalf("expected a symlink to a directory to be accepted like os.MkdirAll: %v", err)
+	}
+	// And through the actual verb, which is what a connect-mode relay serves.
+	if err := MkdirContext(context.Background(), &protocol.FileMkdirPayload{Path: filepath.Join(link, "child"), Recursive: true}); err != nil {
+		t.Fatalf("expected mkdir under a symlinked directory to work: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(real, "child")); err != nil || !info.IsDir() {
+		t.Fatalf("expected the child to be created through the symlink: %v", err)
+	}
+}
+
+// file.write publishes by rename; the staging file it renames must itself never
+// be created through a symlink someone planted in the destination directory.
+func TestWriteContextRefusesAPlantedStagingSymlink(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	dir := filepath.Join(dataRoot, DrivesDirName, "user-1", "agent-1", "workspace")
+	if err := EnsureOwnedDir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dataRoot, "victim.txt")
+	if err := os.WriteFile(outside, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The staging name is unpredictable, so this pins the mechanism rather than a
+	// specific race: creating over an existing name must fail rather than follow
+	// it, whether that name is a symlink or a regular file.
+	if _, _, err := createStagingFile(dir, "WORKSPACE.md"); err != nil {
+		t.Fatalf("staging file creation should succeed on a clean dir: %v", err)
+	}
+	planted := filepath.Join(dir, ".planted")
+	if err := os.Symlink(outside, planted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.OpenFile(planted, os.O_CREATE|os.O_EXCL|os.O_WRONLY|oNoFollow, 0o600); err == nil {
+		t.Fatal("expected O_EXCL|O_NOFOLLOW to refuse an existing symlink")
+	}
+	if content, err := os.ReadFile(outside); err != nil || string(content) != "original" {
+		t.Fatalf("the symlink target must be untouched, got %q %v", content, err)
+	}
+}
+
+// file.copy is the artifact-mirroring path. It must hand both the copied file
+// and every directory it creates to the drive owner — the sh -c 'mkdir -p && cp'
+// it replaced did neither.
+func TestCopyContextHandsMirroredArtifactsToDriveOwner(t *testing.T) {
+	rec := newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	src := filepath.Join(dataRoot, DrivesDirName, "user-1", "child", "taurus", "runs", "run-9", "generated", "image.png")
+	if err := EnsureOwnedDir(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("png-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(dataRoot, DrivesDirName, "user-1", "parent", "taurus", "runs", "run-9", "generated", "image.png")
+	result, err := CopyContext(context.Background(), &protocol.FileCopyPayload{
+		Pairs: []protocol.FileCopyPair{{Src: src, Dest: dest}},
+	})
+	if err != nil {
+		t.Fatalf("CopyContext: %v", err)
+	}
+	if result.Copied != 1 {
+		t.Fatalf("expected 1 copied file, got %d", result.Copied)
+	}
+
+	content, err := os.ReadFile(dest)
+	if err != nil || string(content) != "png-bytes" {
+		t.Fatalf("expected the artifact bytes to land, got %q %v", content, err)
+	}
+	if rec.paths[dest] != remapBase {
+		t.Fatalf("expected the mirrored file to be handed to %s, got %v", remapBase, rec.paths[dest])
+	}
+	for _, dir := range []string{
+		filepath.Join(dataRoot, DrivesDirName, "user-1", "parent"),
+		filepath.Join(dataRoot, DrivesDirName, "user-1", "parent", "taurus"),
+		filepath.Join(dataRoot, DrivesDirName, "user-1", "parent", "taurus", "runs", "run-9", "generated"),
+	} {
+		if rec.paths[dir] != remapBase {
+			t.Fatalf("expected created dir %s to be handed to %s, got %v", dir, remapBase, rec.paths[dir])
+		}
+	}
+	assertOwnedOnDisk(t, dest, remapBase)
+}
+
+func TestCopyContextRefusesPathsOutsideAllowedRoots(t *testing.T) {
+	newChownRecorder(t)
+	dataRoot := withDriveOwnership(t, &remapBase)
+
+	src := filepath.Join(dataRoot, DrivesDirName, "user-1", "child", "taurus", "image.png")
+	if err := EnsureOwnedDir(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := CopyContext(context.Background(), &protocol.FileCopyPayload{
+		Pairs: []protocol.FileCopyPair{{Src: src, Dest: "/tmp/escaped.png"}},
+	}); err == nil {
+		t.Fatal("expected a destination outside the allowed roots to be refused")
+	}
+	if _, err := os.Stat("/tmp/escaped.png"); !os.IsNotExist(err) {
+		t.Fatalf("expected nothing to be written outside the allowed roots, got %v", err)
 	}
 }

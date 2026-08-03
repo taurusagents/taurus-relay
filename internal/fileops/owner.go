@@ -245,6 +245,17 @@ func EnsureOwnedDir(path string, mode os.FileMode) error {
 		if info.IsDir() {
 			return nil
 		}
+		// os.MkdirAll, which this replaced, follows a final symlink and succeeds
+		// when it points at a directory. Connect-mode relays run against real
+		// user home directories where that is ordinary (a symlinked project dir),
+		// so keep the behavior rather than turning it into ENOTDIR. Node mode is
+		// unaffected: ValidatePath has already resolved the path, and nothing in
+		// the drive layout is legitimately a symlink.
+		if info.Mode()&os.ModeSymlink != 0 {
+			if target, statErr := os.Stat(path); statErr == nil && target.IsDir() {
+				return nil
+			}
+		}
 		return &os.PathError{Op: "mkdir", Path: path, Err: errNotDirectory}
 	} else if !os.IsNotExist(err) {
 		return err
@@ -264,6 +275,16 @@ func EnsureOwnedDir(path string, mode os.FileMode) error {
 			componentMode = mode
 		}
 
+		// ⚠️ Component-by-component creation has a swap window that a single
+		// mkdirat(2) does not: between creating component i and creating i+1,
+		// anything with write access to component i-1 could replace component i
+		// with a symlink, and i+1 would then be created through it. Nothing
+		// exploits that today — every path the daemon sends here is either a
+		// pre-container path or inside a directory no container can write (see
+		// the invariant recorded at the daemon's file.mkdir/file.write call
+		// sites) — and closing it properly means resolving through openat2 with
+		// RESOLVE_IN_ROOT and creating with mkdirat(2) relative to a pinned
+		// dirfd (#358). Do not widen the set of callers without that.
 		if err := os.Mkdir(component, componentMode); err != nil {
 			if os.IsExist(err) {
 				// Lost a race with a concurrent create (two launches for the
@@ -314,10 +335,15 @@ func missingDirComponents(path string) ([]string, error) {
 // EnsureOwnedFile creates path as an empty regular file if it is missing and
 // hands it to the drive owner, returning whether it created the file.
 //
-// If the path already exists it is validated (regular file, not a symlink or
-// directory) and otherwise left completely alone: its bytes, mode and ownership
-// are never rewritten. This is the codex auth.json bootstrap path, so clobbering
-// an existing file would destroy live credentials.
+// If the path already exists its bytes and mode are left completely alone — this
+// is the codex auth.json bootstrap path, so clobbering it would destroy live
+// credentials — but its *ownership is verified*. A file left behind by a relay
+// that predates drive ownership (or by a partial migration) is owned by the
+// relay's own uid, and the container that bind-mounts it at 0600 then cannot
+// read its own credentials: exactly the silent breakage this change exists to
+// remove. Report it instead of repairing it, because a wrongly-owned credential
+// file means the tree was not migrated and quietly chowning one file would hide
+// that.
 func EnsureOwnedFile(path string, mode os.FileMode) (bool, error) {
 	if mode == 0 {
 		mode = 0o600
@@ -341,6 +367,9 @@ func EnsureOwnedFile(path string, mode os.FileMode) (bool, error) {
 		if !info.Mode().IsRegular() {
 			return false, fmt.Errorf("%s must be a regular file", path)
 		}
+		if err := verifyExistingOwner(path, info); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	defer f.Close()
@@ -353,4 +382,26 @@ func EnsureOwnedFile(path string, mode os.FileMode) (bool, error) {
 		return true, err
 	}
 	return true, nil
+}
+
+// verifyExistingOwner fails when a pre-existing path inside a managed drive root
+// is not owned by the configured drive owner. Outside the drive roots (connect
+// mode, or the node's own runtime staging paths) ownership is not ours to have
+// an opinion about, so it is not checked.
+func verifyExistingOwner(path string, info os.FileInfo) error {
+	owner := ownerFor(path)
+	if owner == nil {
+		return nil
+	}
+	uid, gid, err := fileOwner(info)
+	if err != nil {
+		return nil // platform without unix ownership; nothing to verify
+	}
+	if uid != owner.UID || gid != owner.GID {
+		return fmt.Errorf(
+			"%s already exists but is owned by %d:%d instead of the configured drive owner %s; "+
+				"the drive tree was not migrated (chown -R %s ...) and the container cannot read it",
+			path, uid, gid, owner, owner)
+	}
+	return nil
 }

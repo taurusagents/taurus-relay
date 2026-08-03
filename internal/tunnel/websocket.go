@@ -457,6 +457,7 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		// codex auth.json host file with the drive owner applied. Connect-mode
 		// relays have no drive tree and keep exactly the file surface they had.
 		h.Register(protocol.TypeFileEnsureFile, t.handleFileEnsureFile)
+		h.Register(protocol.TypeFileCopy, t.handleFileCopy)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -1641,6 +1642,22 @@ func (t *Tunnel) handleFileEnsureFile(msg *protocol.Message) (string, any, error
 		return protocol.TypeFileEnsureFileResult, nil, err
 	}
 	return protocol.TypeFileEnsureFileResult, result, nil
+}
+
+func (t *Tunnel) handleFileCopy(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	var p protocol.FileCopyPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	result, err := fileops.CopyContext(runtime.ctx, &p)
+	if err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	return protocol.TypeFileCopyResult, result, nil
 }
 
 func (t *Tunnel) handleFileRemove(msg *protocol.Message) (string, any, error) {
