@@ -16,8 +16,9 @@ import (
 )
 
 // Node handles the `taurus-relay node` command. maxSessionsFlag is the raw
-// --max-sessions value (< 0 = flag not provided).
-func Node(server, name, host, token, dataPath string, maxContainers int, insecure bool, maxSessionsFlag int) error {
+// --max-sessions value (< 0 = flag not provided). driveOwnerFlag is the raw
+// --drive-owner value ("" = not provided, falls back to TAURUS_DRIVE_OWNER).
+func Node(server, name, host, token, dataPath string, maxContainers int, insecure bool, maxSessionsFlag int, driveOwnerFlag string) error {
 	if err := validateNodePlatform(runtime.GOOS); err != nil {
 		return err
 	}
@@ -58,6 +59,19 @@ func Node(server, name, host, token, dataPath string, maxContainers int, insecur
 
 	fileops.AllowedRoots = []string{dataPath}
 	log.Printf("[relay-node] file operations restricted to: %s", dataPath)
+
+	// Fail closed before connecting: a node that cannot hand its drive
+	// directories to the userns-remap base must never register and start
+	// accepting launches, because every directory it created would be
+	// unwritable by the agent containers that mount it.
+	if err := configureDriveOwnership(driveOwnerFlag, dataPath); err != nil {
+		return fmt.Errorf("drive ownership is not usable: %w", err)
+	}
+	if owner := fileops.ConfiguredDriveOwner(); owner != nil {
+		log.Printf("[relay-node] drive directories under %v are owned by %s (docker userns-remap base)", fileops.DriveRoots(dataPath), owner)
+	} else {
+		log.Printf("[relay-node] drive ownership rewriting is disabled (--drive-owner %s); this node must not run dockerd with userns-remap", fileops.DriveOwnerNone)
+	}
 
 	fmt.Printf("Taurus Relay %s\n", health.Version)
 	fmt.Printf("Starting node mode: %s (%s)\n", name, host)

@@ -49,6 +49,7 @@ func main() {
 		maxContainers := nodeCmd.Int("max-containers", 0, "Maximum containers allowed (0 = unlimited)")
 		insecure := nodeCmd.Bool("insecure", false, "Allow non-TLS (ws://) connections (for local development)")
 		maxSessions := nodeCmd.Int("max-sessions", cmd.MaxSessionsFlagUnset, "Max concurrent proc sessions, 0 = unlimited (default: 1048576, or $TAURUS_RELAY_MAX_SESSIONS)")
+		driveOwner := nodeCmd.String("drive-owner", "", "Owner for drive dirs the relay creates: \"<uid>:<gid>\" docker userns-remap base, or \"none\" (required; or $TAURUS_DRIVE_OWNER)")
 		nodeCmd.Parse(os.Args[2:])
 
 		maxSessionsValue, err := cmd.ValidatedMaxSessionsFlag(nodeCmd, "max-sessions", *maxSessions)
@@ -57,7 +58,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := cmd.Node(*server, *name, *host, *token, *dataPath, *maxContainers, *insecure, maxSessionsValue); err != nil {
+		if err := cmd.Node(*server, *name, *host, *token, *dataPath, *maxContainers, *insecure, maxSessionsValue, *driveOwner); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -114,6 +115,14 @@ Node options:
   --max-containers <n>     Container cap (default: 0 = unlimited)
   --max-sessions <n>       Max concurrent proc sessions, 0 = unlimited (default: 1048576,
                            or the TAURUS_RELAY_MAX_SESSIONS environment variable)
+  --drive-owner <spec>     REQUIRED. Owner for the agent drive directories the relay
+                           creates: "<uid>:<gid>" — the dockerd userns-remap base,
+                           normally 100000:100000 — or "none" on nodes that do not run
+                           dockerd with userns-remap. May also be set via the
+                           TAURUS_DRIVE_OWNER environment variable. Node mode refuses to
+                           start when it is unset, or when the relay cannot actually
+                           apply that ownership (the systemd unit needs CAP_CHOWN,
+                           CAP_DAC_OVERRIDE and CAP_FOWNER).
   --insecure               Allow non-TLS (ws://) connections
 
   Note: Windows releases support connect mode only; node mode is unsupported on Windows.
@@ -126,7 +135,7 @@ Examples:
   taurus-relay connect --server https://taurus.example.com  # uses saved credentials
   taurus-relay connect --insecure --server http://localhost:3000  # local dev
   taurus-relay connect --config-dir ~/relay-work --server https://taurus.example.com  # separate identity
-  taurus-relay node --server https://your-taurus-host.example --name hetzner-1 --host 203.0.113.10 --token <node-enrollment-token>
+  taurus-relay node --server https://your-taurus-host.example --name hetzner-1 --host 203.0.113.10 --token <node-enrollment-token> --drive-owner 100000:100000
   taurus-relay status
 `)
 }

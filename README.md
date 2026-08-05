@@ -139,6 +139,7 @@ are set); `0` means unlimited.
   --host 203.0.113.10 \
   --token <node-enrollment-token> \
   --data-path /data/taurus \
+  --drive-owner 100000:100000 \
   --max-containers 50
 ```
 
@@ -149,11 +150,101 @@ Flags:
 - `--host` public IP / hostname of the node
 - `--token` node enrollment token
 - `--data-path` base path for Taurus drives on the node
+- `--drive-owner` **required.** Who owns the agent drive directories the relay creates
+  (also settable via `TAURUS_DRIVE_OWNER`; the flag wins). See below.
 - `--max-containers` optional node capacity hint
 - `--max-sessions` cap on concurrent proc sessions (default: 1048576; `0` = unlimited;
   also settable via `TAURUS_RELAY_MAX_SESSIONS`, the flag wins). The effective cap is
   reported to the control plane at registration.
 - `--insecure` allow non-TLS `http://` / `ws://` for local development only
+
+#### Drive ownership under `userns-remap` (`--drive-owner`)
+
+Taurus container nodes run `dockerd` with `userns-remap`, so a container's root user is
+a *different host uid* — the remap base, normally `100000:100000`. Anything the relay
+creates under an agent's drive would otherwise be owned by the relay's own unix user and
+unwritable by the agent inside the container. The relay therefore hands **every directory
+and file it creates** under
+
+```text
+<data-path>/taurus-drives
+<data-path>/taurus-drives-trash
+```
+
+to the configured owner — every created component, not just the leaf, because chowning
+only the leaf lets the agent write inside it while silently preventing it from creating
+siblings. Paths the relay creates elsewhere under `--data-path` (the managed seccomp
+profile, for example) are untouched.
+
+`--drive-owner` accepts:
+
+- `<uid>:<gid>` — the userns-remap base. Confirm it with
+  `docker info --format '{{.DockerRootDir}}'`, which reads `/var/lib/docker/100000.100000`
+  on a remapped daemon (`<uid>.<gid>`).
+- `none` — this node does **not** run `dockerd` with `userns-remap`; the relay creates
+  drive directories exactly as before and never chowns anything.
+
+There is no default. **Node mode refuses to start when the value is unset or malformed**,
+and it refuses to start when it cannot actually apply the ownership: at startup it creates
+the two drive roots, verifies they are owned by the configured owner, and creates + chowns
+a throwaway `.taurus-drive-owner-check` directory inside each. A node that would create
+drive directories the container cannot write never registers with the control plane.
+
+The value is never sniffed from `/etc/subuid` or `docker info`. It is an explicit
+deployment input, which the Taurus daemon independently cross-checks against its own
+`docker info` userns-remap probe; a node whose published owner disagrees with that probe
+is refused for agent launches. The relay publishes the configured value to the control
+plane as the `taurus_drive_owner` node metadata key.
+
+> **Upgrade note:** existing nodes that predate `--drive-owner` will refuse to start until
+> the flag or `TAURUS_DRIVE_OWNER` is added to their unit. This is intentional — an
+> implicit default is exactly the silent misconfiguration this flag exists to prevent.
+
+#### Required privileges for node mode
+
+Applying that ownership needs `CAP_CHOWN` (chown to a foreign uid), `CAP_DAC_OVERRIDE`
+(create inside directories owned by the remap base) and `CAP_FOWNER` (chmod/rename them).
+Grant them as **ambient** capabilities so the relay does not have to run as root:
+
+```ini
+[Service]
+User=taurus
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+
+# NoNewPrivileges must stay off: it disables every setuid binary — including the
+# sudo that runs `taurus-quota` for XFS project-quota enforcement — and clears
+# ambient capabilities on exec.
+NoNewPrivileges=no
+
+# Do NOT add CapabilityBoundingSet: it applies to every descendant and can never
+# be raised, so a bounding set of these three capabilities leaves
+# `sudo taurus-quota` running as uid 0 without CAP_SYS_ADMIN (needed by
+# `xfs_quota -x -c limit`) or CAP_DAC_READ_SEARCH (needed by `du`).
+```
+
+Ambient capabilities are **inherited by every process the relay exec's**. That is wider
+than "the relay can chown drive dirs" — but it is currently also load-bearing: Taurus
+still asks older relays to run `mv` (drive trash on agent deletion) and `rm -rf` (artifact
+removal) against directories owned by the remap base, and those children need the same
+three capabilities. This relay routes both through the `file.rename` and `file.remove`
+verbs instead, so nothing it exec's touches a drive path any more.
+
+Once every node in a fleet runs a relay new enough for those verbs, the tighter grant is
+**file capabilities on the binary**, which no child inherits:
+
+```bash
+setcap cap_chown,cap_dac_override,cap_fowner=ep /usr/local/bin/taurus-relay
+```
+
+with `AmbientCapabilities` removed and `NoNewPrivileges=no` kept (under `no_new_privs`,
+exec of a file-capability binary fails outright). Their cost is that they live in the
+binary's extended attributes: they are lost whenever the file is replaced by an upgrade
+and are inert on a filesystem mounted `nosuid`. A forgotten `setcap` is caught by the
+relay's startup self-check, which refuses to start; `getcap /usr/local/bin/taurus-relay`
+confirms it.
+
+Running the relay as `root` also works and needs no capability configuration. The relay
+does not care which mechanism supplied its authority — its startup check is empirical.
 
 ## Expected control plane compatibility
 

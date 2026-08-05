@@ -232,6 +232,45 @@ type FileGrepResultPayload struct {
 type FileMkdirPayload struct {
 	Path      string `json:"path"`
 	Recursive bool   `json:"recursive,omitempty"`
+	// Mode is the permission bits for directories this request creates
+	// (0 = the 0755 default). Directories that already exist are never chmodded.
+	Mode uint32 `json:"mode,omitempty"`
+}
+
+// FileEnsureFilePayload asks the relay to make sure a regular file exists at
+// Path, without ever overwriting one that is already there.
+type FileEnsureFilePayload struct {
+	Path string `json:"path"`
+	Mode uint32 `json:"mode,omitempty"` // 0 = 0600
+}
+
+type FileEnsureFileResultPayload struct {
+	// Created is false when the file was already present and was left untouched.
+	Created bool `json:"created"`
+}
+
+// FileCopyPayload asks the node to copy files locally, on the node's own disk,
+// through the same ownership choke point as every other relay-side write.
+type FileCopyPayload struct {
+	Pairs []FileCopyPair `json:"pairs"`
+	// Mode overrides the destination permission bits; 0 keeps the source's.
+	Mode uint32 `json:"mode,omitempty"`
+}
+
+type FileCopyPair struct {
+	Src  string `json:"src"`
+	Dest string `json:"dest"`
+}
+
+type FileCopyResultPayload struct {
+	Copied int `json:"copied"`
+}
+
+// FileRenamePayload asks the node to rename(2) a path. The destination is never
+// clobbered, and the operation can never degrade into copy+delete.
+type FileRenamePayload struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 type FileRemovePayload struct {
@@ -351,6 +390,16 @@ const (
 	TypeFileMkdirResult  = "file.mkdir.result"
 	TypeFileRemove       = "file.remove"
 	TypeFileRemoveResult = "file.remove.result"
+	// file.ensure_file creates a missing regular file (owned by the configured
+	// drive owner) and leaves an existing one untouched.
+	TypeFileEnsureFile       = "file.ensure_file"
+	TypeFileEnsureFileResult = "file.ensure_file.result"
+	// file.copy copies files node-locally with drive ownership applied.
+	TypeFileCopy       = "file.copy"
+	TypeFileCopyResult = "file.copy.result"
+	// file.rename is a true rename(2) that refuses to clobber its destination.
+	TypeFileRename       = "file.rename"
+	TypeFileRenameResult = "file.rename.result"
 
 	TypeAuth               = "auth"
 	TypeAuthResult         = "auth.result"

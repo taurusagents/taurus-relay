@@ -453,6 +453,12 @@ func (t *Tunnel) registerHandlers(mode Mode) {
 		h.Register(protocol.TypeProcSignal, t.handleProcSignal)
 		h.Register(protocol.TypeProcKill, t.handleProcKill)
 		h.Register(protocol.TypeProcCheckAlive, t.handleProcCheckAlive)
+		// Node-mode only: file.ensure_file exists so Taurus can bootstrap the
+		// codex auth.json host file with the drive owner applied. Connect-mode
+		// relays have no drive tree and keep exactly the file surface they had.
+		h.Register(protocol.TypeFileEnsureFile, t.handleFileEnsureFile)
+		h.Register(protocol.TypeFileCopy, t.handleFileCopy)
+		h.Register(protocol.TypeFileRename, t.handleFileRename)
 	}
 
 	h.Register(protocol.TypeFileRead, t.handleFileRead)
@@ -738,24 +744,31 @@ func (t *Tunnel) buildNodeRegisterPayload(ramGB float64, cpus int, sys *protocol
 		AllocatableCPUs:  cpus,
 		MaxContainers:    t.node.MaxContainers,
 		MaxProcSessions:  t.maxSessions,
-		Meta:             buildNodeRegisterMeta(t.node.DataPath, sys, hostname),
+		Meta:             buildNodeRegisterMeta(t.node.DataPath, sys, hostname, fileops.DriveOwnerSetting()),
 	}
 }
 
 // buildNodeRegisterMeta publishes the canonical Taurus data root plus the exact
 // current drives root Taurus should use. It also keeps the current Taurus
 // compatibility marker for legacy node-capacity accounting.
-func buildNodeRegisterMeta(dataPath string, sys *protocol.HeartbeatPayload, hostname string) map[string]string {
+//
+// driveOwner is the configured userns-remap drive owner ("<uid>:<gid>" or
+// "none"). Publishing it lets the daemon cross-check this node's ownership
+// configuration against its own docker userns-remap probe and refuse to launch
+// agents onto a node that would create drive directories the container cannot
+// write.
+func buildNodeRegisterMeta(dataPath string, sys *protocol.HeartbeatPayload, hostname, driveOwner string) map[string]string {
 	dataRoot := filepath.Clean(dataPath)
-	drivePath := filepath.Join(dataRoot, "taurus-drives")
+	drivePath := filepath.Join(dataRoot, fileops.DrivesDirName)
 
 	return map[string]string{
-		"os":                sys.OS,
-		"arch":              sys.Arch,
-		"hostname":          hostname,
-		"container_count":   "0",
-		"data_root":         dataRoot,
-		"taurus_drive_path": drivePath,
+		"os":                 sys.OS,
+		"arch":               sys.Arch,
+		"hostname":           hostname,
+		"container_count":    "0",
+		"data_root":          dataRoot,
+		"taurus_drive_path":  drivePath,
+		"taurus_drive_owner": driveOwner,
 	}
 }
 
@@ -1614,6 +1627,53 @@ func (t *Tunnel) handleFileMkdir(msg *protocol.Message) (string, any, error) {
 		return protocol.TypeFileMkdirResult, nil, err
 	}
 	return protocol.TypeFileMkdirResult, map[string]string{"status": "ok"}, nil
+}
+
+func (t *Tunnel) handleFileEnsureFile(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeFileEnsureFileResult, nil, err
+	}
+	var p protocol.FileEnsureFilePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileEnsureFileResult, nil, err
+	}
+	result, err := fileops.EnsureFileContext(runtime.ctx, &p)
+	if err != nil {
+		return protocol.TypeFileEnsureFileResult, nil, err
+	}
+	return protocol.TypeFileEnsureFileResult, result, nil
+}
+
+func (t *Tunnel) handleFileCopy(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	var p protocol.FileCopyPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	result, err := fileops.CopyContext(runtime.ctx, &p)
+	if err != nil {
+		return protocol.TypeFileCopyResult, nil, err
+	}
+	return protocol.TypeFileCopyResult, result, nil
+}
+
+func (t *Tunnel) handleFileRename(msg *protocol.Message) (string, any, error) {
+	runtime, err := t.runtimeSnapshotForMessage(msg)
+	if err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	var p protocol.FileRenamePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	if err := fileops.RenameContext(runtime.ctx, &p); err != nil {
+		return protocol.TypeFileRenameResult, nil, err
+	}
+	return protocol.TypeFileRenameResult, map[string]string{"status": "ok"}, nil
 }
 
 func (t *Tunnel) handleFileRemove(msg *protocol.Message) (string, any, error) {
