@@ -205,7 +205,9 @@ verify_checksum() {
     # a digest, so ask which one it was and name it: "install something" is not
     # actionable, "sha256sum failed" is.
     digest_tool=$(sha256_backend) || digest_tool='the digest tool'
-    fail "could not compute a sha256 digest for ${archive_name}: ${digest_tool} failed, or the file could not be read. This usually means a problem with this machine rather than with the download."
+    fail "could not compute a sha256 digest for ${archive_name}: ${digest_tool} failed, or the file could not be read. This usually means a problem with this machine rather than with the download. To check the download somewhere else:
+  archive:  ${archive_url}
+  expected: ${expected}"
   fi
 
   if [ "$actual" != "$expected" ]; then
@@ -223,11 +225,14 @@ verify_checksum() {
 # uname and the digests to lowercase), sed (trims the server URL), id and uname
 # (choose the install directory and the platform) do not even produce an error:
 # they leave an empty string behind, and the script carries on with an empty OS
-# name, an empty digest, or quietly the wrong install directory.
+# name, an empty digest, or quietly the wrong install directory. mktemp is here
+# because the check further down that catches it failing can only explain the
+# failure it was written for, a TMPDIR that does not work; a machine with no
+# mktemp at all would be sent to look at TMPDIR for nothing.
 #
-# mkdir, cp, chmod and mktemp are deliberately not listed. Their own failure
-# already names the operation that failed on this machine, so there is nothing
-# for a check up here to add.
+# mkdir, cp and chmod are deliberately not listed. Each is used once, next to a
+# message that already names that step, so a check up here would say the same
+# thing slightly earlier and nothing more.
 need_cmd curl
 need_cmd tar
 need_cmd awk
@@ -235,6 +240,7 @@ need_cmd tr
 need_cmd sed
 need_cmd id
 need_cmd uname
+need_cmd mktemp
 
 install_dir=$(resolve_install_dir) || fail "$install_dir"
 mkdir -p "$install_dir" || fail "failed to create install dir: $install_dir"
@@ -267,7 +273,13 @@ checksums_url="${release_base_url}/checksums.txt"
 # built from it would start at the filesystem root: as root the download and
 # the extracted tree land in /, the trap's rm -rf deletes nothing, and the run
 # reports a successful install.
-tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t taurus-relay-installer) || tmpdir=''
+#
+# The second form exists for the BSD and macOS mktemp. Both attempts are kept
+# quiet, unlike the digest tools further up: GNU coreutils rejects that second
+# template outright with "too few X's", which is a complaint about this script
+# rather than about anything the reader can fix, and it would print on every
+# Linux machine that reaches here.
+tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t taurus-relay-installer 2>/dev/null) || tmpdir=''
 [ -n "$tmpdir" ] && [ -d "$tmpdir" ] ||
   fail "failed to create a temporary directory (TMPDIR is ${TMPDIR:-unset}); set TMPDIR to an existing writable directory"
 trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
@@ -307,10 +319,10 @@ TAURUS_URL=$(normalize_url "$TAURUS_URL")
 # URL schemes are case-insensitive, so HTTP:// is just as plaintext as http://
 # and has to raise the same warning. Only the comparison uses the lowercased
 # copy; what reaches the binary is the string the user gave us.
-taurus_url_scheme=$(lowercase "$TAURUS_URL")
+taurus_url_lower=$(lowercase "$TAURUS_URL")
 
 set -- connect --token "$TAURUS_TOKEN" --server "$TAURUS_URL"
-case "$taurus_url_scheme" in
+case "$taurus_url_lower" in
   http://*)
     log "Warning: ${TAURUS_URL} is non-TLS; passing --insecure to taurus-relay connect."
     set -- connect --insecure --token "$TAURUS_TOKEN" --server "$TAURUS_URL"
