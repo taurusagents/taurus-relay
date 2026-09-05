@@ -309,11 +309,12 @@ verify_checksum() {
   # compute_sha256, so that the comparison below depends on nothing but itself.
   # It gets its own branch rather than sharing the one above, because reaching
   # it means compute_sha256 reported success and returned something that is not
-  # a digest: no tool misbehaved, this script did, and naming a tool here would
-  # be the same false accusation this check exists to prevent. Nowhere to send
-  # the reader either, so it says what it knows and stops.
+  # a digest. Whatever went wrong did so upstream of a check that then reported
+  # success, so there is no telling from here which tool was involved, and
+  # naming one would be the same false accusation this check exists to prevent.
+  # Nowhere to send the reader either, so it says what it knows and stops.
   if ! is_sha256 "$actual"; then
-    fail "the installer computed something that is not a sha256 digest for ${archive_name}, so it cannot check the download. This is a fault in the installer itself rather than in the download or in any tool on this machine:
+    fail "the installer computed something that is not a sha256 digest for ${archive_name}, so it cannot check the download. This is a fault in the installer itself rather than in the download:
   archive:  ${archive_url}
   expected: ${expected}"
   fi
@@ -406,8 +407,8 @@ tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t taurus-relay-installer 2>/dev/nul
 # Armed as soon as there is a directory to remove. The gap between mktemp
 # returning and the first trap being installed is not closable: a shell cannot
 # create a resource and arm its handler in one indivisible step, so a signal
-# landing in that gap still leaves the directory behind. Keeping the gap to
-# assignments with no I/O in them is as far as this goes.
+# landing in that gap still leaves the directory behind. Keeping the gap down
+# to the two shell tests above is as far as this goes.
 #
 # The exit trap covers every ordinary end. Signals need handlers that exit,
 # because a handler that simply returns lets the script continue from where it
