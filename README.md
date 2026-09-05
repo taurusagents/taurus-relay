@@ -300,7 +300,7 @@ Current support notes:
 - **Linux**: fully supported for both `connect` and `node` mode.
 - **macOS**: supported for `connect`; `node` mode is not supported because Taurus container hosting depends on Linux Docker semantics.
 - **Windows**: release binaries are built and published, and Windows is supported for install plus `connect` mode. Interactive shell sessions may require the Taurus control plane to request a Windows-appropriate shell (for example `powershell.exe`) instead of assuming `bash`. `node` mode is explicitly unsupported on Windows; Windows releases are connect-only.
-- The public installers depend on the archive naming above staying stable as `taurus-relay_<version>_<os>_<arch>.(tar.gz|zip)` plus `checksums.txt`; `.goreleaser.yaml` now pins that explicitly.
+- The public installers build the asset names themselves, so they depend on the archive naming staying stable as `taurus-relay_<os>_<arch>.(tar.gz|zip)` — versionless — plus `checksums.txt`; the `name_template` in `.goreleaser.yaml` pins that explicitly.
 
 ### How to cut a release
 
