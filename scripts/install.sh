@@ -295,14 +295,25 @@ verify_checksum() {
   expected: ${expected}"
   fi
 
-  # The shape of the computed digest is checked here as well as inside
-  # compute_sha256, so that this comparison depends on nothing but itself.
-  if [ "$status" -ne 0 ] || ! is_sha256 "$actual"; then
-    # Any status other than 3 means a tool was found and then could not produce
-    # a digest, so ask which one it was and name it: "install something" is not
-    # actionable, "sha256sum failed" is.
+  if [ "$status" -ne 0 ]; then
+    # Any status other than 3 or 4 means a tool was found and then could not
+    # produce a digest, so ask which one it was and name it: "install
+    # something" is not actionable, "sha256sum failed" is.
     digest_tool=$(sha256_backend) || digest_tool='the digest tool'
     fail "could not compute a sha256 digest for ${archive_name}: ${digest_tool} failed, or the file could not be read. This usually means a problem with this machine rather than with the download. To check the download somewhere else:
+  archive:  ${archive_url}
+  expected: ${expected}"
+  fi
+
+  # The shape of the computed digest is checked here as well as inside
+  # compute_sha256, so that the comparison below depends on nothing but itself.
+  # It gets its own branch rather than sharing the one above, because reaching
+  # it means compute_sha256 reported success and returned something that is not
+  # a digest: no tool misbehaved, this script did, and naming a tool here would
+  # be the same false accusation this check exists to prevent. Nowhere to send
+  # the reader either, so it says what it knows and stops.
+  if ! is_sha256 "$actual"; then
+    fail "the installer computed something that is not a sha256 digest for ${archive_name}, so it cannot check the download. This is a fault in the installer itself rather than in the download or in any tool on this machine:
   archive:  ${archive_url}
   expected: ${expected}"
   fi
@@ -392,8 +403,11 @@ tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t taurus-relay-installer 2>/dev/nul
 [ -n "$tmpdir" ] && [ -d "$tmpdir" ] ||
   fail "failed to create a temporary directory (TMPDIR is ${TMPDIR:-unset}); set TMPDIR to an existing writable directory"
 
-# Armed on the very next line after the directory exists, so there is no window
-# in which a signal can leave it behind.
+# Armed as soon as there is a directory to remove. The gap between mktemp
+# returning and the first trap being installed is not closable: a shell cannot
+# create a resource and arm its handler in one indivisible step, so a signal
+# landing in that gap still leaves the directory behind. Keeping the gap to
+# assignments with no I/O in them is as far as this goes.
 #
 # The exit trap covers every ordinary end. Signals need handlers that exit,
 # because a handler that simply returns lets the script continue from where it
@@ -419,8 +433,27 @@ verify_checksum "$archive_path" "$checksums_path" "$archive_name" "$archive_url"
 tar -xzf "$archive_path" -C "$extract_dir" || fail "failed to extract ${archive_name}"
 [ -f "$extract_dir/taurus-relay" ] || fail 'archive did not contain taurus-relay binary'
 
-cp "$extract_dir/taurus-relay" "$binary_tmp" || fail "failed to write ${binary_tmp}"
-chmod 0755 "$binary_tmp" || fail "failed to chmod ${binary_tmp}"
+# The staged file is removed by cleanup() on every failure this script can
+# catch. A kill that cannot be trapped - SIGKILL, the OOM killer, power loss -
+# in the moment between the copy and the rename can still leave one behind. It
+# is inert: hidden, never executed, and never named by anything here. Sweeping
+# for leftovers on startup is deliberately not done, because a stale staged
+# file is indistinguishable from one a concurrently running installer is about
+# to rename into place, and deleting that would break a second install running
+# alongside this one.
+cp "$extract_dir/taurus-relay" "$binary_tmp" ||
+  fail "failed to install taurus-relay into ${install_dir}: could not write the new binary (staged at ${binary_tmp})"
+chmod 0755 "$binary_tmp" ||
+  fail "failed to install taurus-relay into ${install_dir}: could not make the new binary executable (staged at ${binary_tmp})"
+
+# mv -f onto an existing directory moves the staged file inside it and reports
+# success, which would end with this script announcing an install that did not
+# happen. Nothing else here would notice: the announcement, the PATH note and
+# the exit status would all be those of a successful run.
+if [ -d "$binary_path" ]; then
+  fail "cannot install taurus-relay: ${binary_path} is a directory. Remove it, or set TAURUS_INSTALL_DIR to somewhere else."
+fi
+
 # One rename, so anyone looking at the destination sees either the previous
 # binary or the new one and never a half-written file. It is also the only way
 # to replace a binary that is currently running: writing onto it fails with
