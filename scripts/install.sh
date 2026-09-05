@@ -25,6 +25,15 @@ normalize_url() {
   printf '%s' "$1" | sed 's#/*$##'
 }
 
+# Removes everything this script creates that must not outlive it: the
+# temporary download directory, and the staged binary if a run ended between
+# writing it and renaming it into place. It reads tmpdir and binary_tmp, so it
+# must not be installed as a trap before both of those are assigned.
+cleanup() {
+  rm -rf "$tmpdir"
+  rm -f "$binary_tmp"
+}
+
 # The two resolvers below are called inside a command substitution, so they
 # must not call fail(): the exit would only end the subshell and the script
 # would keep running with an empty value. Instead they print the error message
@@ -37,7 +46,19 @@ resolve_install_dir() {
     return 0
   fi
 
-  if [ "$(id -u)" -eq 0 ]; then
+  # Capture the uid and check it is a number before comparing. `[ "" -eq 0 ]`
+  # is an error rather than a false, and an error here is simply a branch not
+  # taken: the root check would silently fall through to the per-user path and
+  # a root install would land somewhere nobody asked for and report success.
+  uid=$(id -u) || uid=''
+  case $uid in
+    '' | *[!0-9]*)
+      printf '%s\n' 'could not read the current user id from id -u; set TAURUS_INSTALL_DIR explicitly'
+      return 1
+      ;;
+  esac
+
+  if [ "$uid" -eq 0 ]; then
     printf '%s\n' "/usr/local/bin"
     return 0
   fi
@@ -52,6 +73,19 @@ resolve_install_dir() {
 resolve_platform() {
   os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m 2>/dev/null)
+
+  # Detection producing nothing is not the same as detecting something we do
+  # not support. Reporting it as "unsupported OS: " tells a customer their
+  # system is not supported when what actually happened is that uname or tr
+  # did not answer, and there is nothing in that message they can act on.
+  if [ -z "$os" ]; then
+    printf '%s\n' 'could not detect the operating system: "uname -s | tr" produced nothing. Check that uname and tr work on this machine.'
+    return 1
+  fi
+  if [ -z "$arch" ]; then
+    printf '%s\n' 'could not detect the machine architecture: "uname -m" produced nothing. Check that uname works on this machine.'
+    return 1
+  fi
 
   case "$os" in
     linux) os='linux' ;;
@@ -78,6 +112,30 @@ lowercase() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+# is_hex64 is the shape a SHA-256 digest has however it is written; is_sha256
+# is the shape it has after case has been folded, which is the only form the
+# comparison in verify_checksum ever sees.
+#
+# Every value on its way to that comparison is checked, before and after the
+# fold, because two empty strings compare equal and the comparison is the only
+# thing between the caller and bytes nobody checked. Checking on both sides of
+# the fold also says which step went wrong: a value that was never a digest
+# came from the file or the digest tool, while one that was a digest and is not
+# any more was mangled by the fold.
+is_hex64() {
+  case $1 in
+    *[!0-9a-fA-F]*) return 1 ;;
+  esac
+  [ ${#1} -eq 64 ]
+}
+
+is_sha256() {
+  case $1 in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  [ ${#1} -eq 64 ]
+}
+
 # Names the digest tool this machine will use, or prints nothing and returns 1
 # if it has none. It is the single place the preference order is written down,
 # so compute_sha256 and the message that has to name the tool cannot disagree.
@@ -97,8 +155,9 @@ sha256_backend() {
 }
 
 # Prints the lowercase SHA-256 of a file. Exit status: 0 with the digest on
-# stdout, 2 if a tool was found but could not produce a digest, 3 if no tool
-# exists at all.
+# stdout, 2 if a digest tool was found but could not produce a digest, 3 if no
+# digest tool exists at all, 4 if a digest was produced and then lost folding
+# its case.
 #
 # This is called inside a command substitution, so it must never call fail():
 # the exit would only end the subshell. The caller maps the status to a
@@ -109,8 +168,9 @@ sha256_backend() {
 # its path, so no filename can end up in their output. GNU coreutils escapes
 # odd characters in the name it echoes back and marks the whole line with a
 # leading backslash; since the temporary directory comes from mktemp, which
-# honours a user-controlled TMPDIR, that backslash could otherwise glue itself
-# to the digest and read as tampering. None of these run in a pipeline either,
+# honours a user-controlled TMPDIR, that backslash would otherwise be glued to
+# the digest and this would refuse to install on any machine whose TMPDIR
+# contains a backslash or a newline. None of these run in a pipeline either,
 # so the tool's own exit status survives. Their stderr is left alone as well,
 # so whatever the tool has to say about its own failure reaches the user.
 compute_sha256() {
@@ -146,13 +206,32 @@ compute_sha256() {
   esac
 
   # A backend that exits 0 but prints something that is not a digest is a
-  # broken tool, not a bad download, so report it as such.
-  case $digest_value in
-    '' | *[!0-9a-fA-F]*) return 2 ;;
-  esac
-  [ ${#digest_value} -eq 64 ] || return 2
+  # broken tool, not a bad download.
+  is_hex64 "$digest_value" || return 2
 
-  lowercase "$digest_value"
+  # Fold case, then check again, then print the value that was checked. The
+  # order matters: validating one value and emitting another leaves the caller
+  # holding something nothing ever looked at, and a fold that returned success
+  # without returning the string would hand back an empty digest with a success
+  # status. The fold gets its own status because it is a different tool, and
+  # blaming the digest backend for what tr did would be a lie.
+  digest_value=$(lowercase "$digest_value") || return 4
+  is_sha256 "$digest_value" || return 4
+
+  printf '%s\n' "$digest_value"
+}
+
+# Both digests are folded to lowercase with tr before they are compared, so tr
+# is a second tool that can fail on its own. Saying so is worth a message of its
+# own: naming the digest backend here would blame the wrong thing, and a fold
+# that returns success without returning the string leaves a value that would
+# compare equal to any other empty one.
+#
+# Arguments: the URL the archive came from, and the digest published for it.
+fail_fold() {
+  fail "could not fold a sha256 digest to lowercase: tr failed, or returned something other than the digest it was given. This usually means a problem with this machine rather than with the download. To check the download somewhere else:
+  archive:  ${1}
+  expected: ${2}"
 }
 
 # Arguments: the downloaded archive, the downloaded checksums file, the
@@ -166,7 +245,7 @@ verify_checksum() {
   archive_url=$4
   checksums_url=$5
 
-  expected=$(awk -v name="$archive_name" '$2 == name { print $1; exit }' "$checksums_path")
+  published=$(awk -v name="$archive_name" '$2 == name { print $1; exit }' "$checksums_path")
   awk_status=$?
 
   # A checksums file we could not read is a different problem from a checksums
@@ -178,17 +257,33 @@ verify_checksum() {
   checksums: ${checksums_url}"
   fi
 
-  if [ -z "$expected" ]; then
+  if [ -z "$published" ]; then
     fail "the checksums file downloaded for this release has no entry for ${archive_name}:
   checksums: ${checksums_url}"
   fi
 
-  # goreleaser writes lowercase and every backend above agrees, but the
-  # Windows installer normalises case on both sides and this one should too.
-  expected=$(lowercase "$expected")
+  # A line that exists but whose digest field is not a digest means the file we
+  # received is corrupt, so there is nothing to check the download against. The
+  # field is deliberately not echoed back: until this test passes it is
+  # arbitrary bytes from the network, and the URL is enough to go and look.
+  if ! is_hex64 "$published"; then
+    fail "the entry for ${archive_name} in the checksums file downloaded for this release is not a sha256 digest, so there is nothing to check the download against. A corrupted copy looks like this:
+  checksums: ${checksums_url}"
+  fi
+
+  # goreleaser writes lowercase and every backend above agrees, but the Windows
+  # installer normalises case on both sides and this one should too. Past this
+  # point the published digest is known to be a digest, so if the fold returns
+  # something else it is the fold that broke, not the file.
+  expected=$(lowercase "$published")
+  is_sha256 "$expected" || fail_fold "$archive_url" "$published"
 
   actual=$(compute_sha256 "$archive_path")
   status=$?
+
+  if [ "$status" -eq 4 ]; then
+    fail_fold "$archive_url" "$published"
+  fi
 
   if [ "$status" -eq 3 ]; then
     # Refusing here is deliberate. This installs a binary that runs as a
@@ -200,7 +295,9 @@ verify_checksum() {
   expected: ${expected}"
   fi
 
-  if [ "$status" -ne 0 ]; then
+  # The shape of the computed digest is checked here as well as inside
+  # compute_sha256, so that this comparison depends on nothing but itself.
+  if [ "$status" -ne 0 ] || ! is_sha256 "$actual"; then
     # Any status other than 3 means a tool was found and then could not produce
     # a digest, so ask which one it was and name it: "install something" is not
     # actionable, "sha256sum failed" is.
@@ -223,16 +320,20 @@ verify_checksum() {
 # "failed to extract", which point at the release rather than at this machine.
 # awk (reads the expected digest out of checksums.txt), tr (folds the output of
 # uname and the digests to lowercase), sed (trims the server URL), id and uname
-# (choose the install directory and the platform) do not even produce an error:
-# they leave an empty string behind, and the script carries on with an empty OS
-# name, an empty digest, or quietly the wrong install directory. mktemp is here
+# (choose the install directory and the platform) leave an empty string behind
+# when they are missing, and the script would carry on with an empty OS name,
+# an empty digest, or quietly the wrong install directory. mktemp is here
 # because the check further down that catches it failing can only explain the
 # failure it was written for, a TMPDIR that does not work; a machine with no
 # mktemp at all would be sent to look at TMPDIR for nothing.
 #
-# mkdir, cp and chmod are deliberately not listed. Each is used once, next to a
-# message that already names that step, so a check up here would say the same
-# thing slightly earlier and nothing more.
+# mkdir, cp, mv and chmod are deliberately not listed: each failure site names
+# the step it belongs to, so a check up here would say the same thing slightly
+# earlier and nothing more. Decompression helpers such as gzip are left out for
+# a different reason - whether one is even needed depends on the tar
+# implementation, since BusyBox and bsdtar decompress internally, so requiring
+# it would turn away machines that work; when GNU tar does need it, it names it
+# on the line above ours.
 need_cmd curl
 need_cmd tar
 need_cmd awk
@@ -245,6 +346,14 @@ need_cmd mktemp
 install_dir=$(resolve_install_dir) || fail "$install_dir"
 mkdir -p "$install_dir" || fail "failed to create install dir: $install_dir"
 [ -w "$install_dir" ] || fail "install dir is not writable: $install_dir"
+
+binary_path="$install_dir/taurus-relay"
+# The binary is written under a temporary name in the install directory and
+# renamed into place. The name is hidden and carries this shell's pid, so two
+# installers running at once cannot collide on it. Both names are settled here
+# rather than at the point of use, so that cleanup() has everything it reads
+# before any trap referring to it is armed.
+binary_tmp="$install_dir/.taurus-relay.$$"
 
 platform=$(resolve_platform) || fail "$platform"
 # Unquoted on purpose: resolve_platform prints "<os> <arch>" for splitting.
@@ -282,7 +391,20 @@ checksums_url="${release_base_url}/checksums.txt"
 tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t taurus-relay-installer 2>/dev/null) || tmpdir=''
 [ -n "$tmpdir" ] && [ -d "$tmpdir" ] ||
   fail "failed to create a temporary directory (TMPDIR is ${TMPDIR:-unset}); set TMPDIR to an existing writable directory"
-trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
+
+# Armed on the very next line after the directory exists, so there is no window
+# in which a signal can leave it behind.
+#
+# The exit trap covers every ordinary end. Signals need handlers that exit,
+# because a handler that simply returns lets the script continue from where it
+# was interrupted: a Ctrl-C between staging the binary and starting it would
+# otherwise delete the temporary directory and then run the daemon anyway.
+# 128 plus the signal number is the status a shell reports for a process that
+# was killed by that signal.
+trap cleanup 0
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 archive_path="$tmpdir/$archive_name"
 checksums_path="$tmpdir/checksums.txt"
@@ -297,9 +419,14 @@ verify_checksum "$archive_path" "$checksums_path" "$archive_name" "$archive_url"
 tar -xzf "$archive_path" -C "$extract_dir" || fail "failed to extract ${archive_name}"
 [ -f "$extract_dir/taurus-relay" ] || fail 'archive did not contain taurus-relay binary'
 
-binary_path="$install_dir/taurus-relay"
-cp "$extract_dir/taurus-relay" "$binary_path" || fail "failed to copy binary to ${binary_path}"
-chmod 0755 "$binary_path" || fail "failed to chmod ${binary_path}"
+cp "$extract_dir/taurus-relay" "$binary_tmp" || fail "failed to write ${binary_tmp}"
+chmod 0755 "$binary_tmp" || fail "failed to chmod ${binary_tmp}"
+# One rename, so anyone looking at the destination sees either the previous
+# binary or the new one and never a half-written file. It is also the only way
+# to replace a binary that is currently running: writing onto it fails with
+# ETXTBSY, and re-running this installer while the relay is up is the ordinary
+# way to upgrade.
+mv -f "$binary_tmp" "$binary_path" || fail "failed to install ${binary_path}"
 
 log "Installed taurus-relay to ${binary_path}"
 case ":$PATH:" in
@@ -328,6 +455,12 @@ case "$taurus_url_lower" in
     set -- connect --insecure --token "$TAURUS_TOKEN" --server "$TAURUS_URL"
     ;;
 esac
+
+# exec replaces this process, so the exit trap will never run. Without this,
+# every successful install leaves the archive and a second copy of the daemon
+# binary behind under TMPDIR. The traps stay armed for the case where exec
+# itself fails; removing an already-removed path is not an error.
+cleanup
 
 log "Starting taurus-relay connect against ${TAURUS_URL}..."
 exec "$binary_path" "$@"

@@ -48,8 +48,14 @@ These are the public bootstrap scripts intended to be served at:
 - `https://get.taurusagents.com/relay.ps1` → `scripts/install.ps1`
 
 Both installers download the latest GitHub release artifact for the current platform,
-verify it against `checksums.txt`, install the binary locally, and then run
-`taurus-relay connect`.
+check it against the digest published in `checksums.txt` for the same release, install
+the binary locally, and then run `taurus-relay connect`.
+
+That check is mandatory. `scripts/install.sh` computes the digest with the first of
+`sha256sum`, `shasum`, `openssl` or `python3` that it finds, and if a machine has none
+of them it stops with an error instead of installing a binary it could not check — so a
+minimal container may need one installed first (`sha256sum` comes with `coreutils`).
+`scripts/install.ps1` uses the built-in `Get-FileHash` and needs nothing extra.
 
 Because they use GitHub's stable `releases/latest/download/...` URLs, cut a fresh
 relay release after merging these installer changes before wiring `get.taurusagents.com`
