@@ -78,7 +78,23 @@ verify_checksum() {
     return
   fi
 
-  log 'Warning: neither sha256sum nor shasum is available; skipping checksum verification.'
+  if command -v openssl >/dev/null 2>&1; then
+    actual=$(openssl dgst -sha256 "$archive_path" | awk '{print $NF}')
+    [ "$actual" = "$expected" ] || fail "checksum verification failed for ${archive_name}"
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    actual=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$archive_path") \
+      || fail "could not compute a checksum for ${archive_name}"
+    [ "$actual" = "$expected" ] || fail "checksum verification failed for ${archive_name}"
+    return
+  fi
+
+  # Refusing here is deliberate. This installs a binary that runs as a
+  # privileged daemon, so an unverified download is worse than no install at
+  # all, and continuing with a warning meant nobody ever saw it.
+  fail "cannot verify the download: none of sha256sum, shasum, openssl or python3 is available. Install one of them (for example the coreutils package) and run this again."
 }
 
 need_cmd curl
